@@ -93,7 +93,7 @@ struct MoeOffloadSessionPolicy {
   bool allow_file_backing{true};
   bool popularity_file_explicit{false};
   int32_t cpu_threads{0};            // 0 = auto physical-core discovery
-  int32_t async_max_tokens{4};       // Decode vs. prefill streaming token threshold
+  int32_t async_max_tokens{8};       // Decode vs. prefill streaming token threshold (S <= 8 DFlash2)
   int32_t prefill_wave_experts{32};  // Max active cold experts per DMA wave
   bool skip_zero_cold_doorbell{false};
 
