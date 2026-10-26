@@ -114,12 +114,15 @@ class TensorExpertStore {
 // and background generation-tagged prefetch worker (v3 Section 6, Section 10 & P3).
 class FileExpertStore {
  public:
+  static constexpr int kLoadChunksPerExpert = 4;
   struct MappedBank {
     const void* data = nullptr;
     size_t expert_bytes = 0;
     size_t block_offset = 0;
     const char* file_path = nullptr;
     uint64_t file_offset = 0;
+    int32_t transpose_rows = 0;
+    int32_t transpose_cols = 0;
   };
   FileExpertStore() = default;
   ~FileExpertStore() noexcept;
@@ -143,6 +146,12 @@ class FileExpertStore {
   // cannot be taken. Every successful call must be followed by FinishReplace(new_id, ok).
   uint8_t* BeginReplace(int32_t old_id, int32_t new_id) noexcept;
   void FinishReplace(int32_t new_id, bool ok) noexcept;
+  // Multi-threaded miss loading: returns 0 if already Ready (fills out_ready_lease), 1 if a victim slot was
+  // reserved in kLoading state (fills *out_slot_dst for kLoadChunksPerExpert parallel LoadExpertChunk calls
+  // followed by FinishLoadExpert), or -1 if caller should fall back to AcquireReady.
+  int BeginLoadExpert(int32_t expert_id, uint8_t** out_slot_dst, ExpertBlockLease* out_ready_lease) noexcept;
+  bool LoadExpertChunk(int32_t expert_id, uint8_t* slot_dst, int chunk_idx) noexcept;
+  bool FinishLoadExpert(int32_t expert_id, bool ok, ExpertBlockLease* out_lease) noexcept;
   bool TryAcquireCached(int32_t expert_id, ExpertBlockLease* out_lease) noexcept;
   bool ReadExpertDirect(int32_t expert_id, uint8_t* dst) noexcept;
   bool TryAcquireGroupCached(const int32_t* expert_ids, size_t count, ExpertBlockLease* out_leases) noexcept;
@@ -233,13 +242,13 @@ bool MakeInt3ExpertBlockLayout(int64_t hidden, int64_t inter, int64_t block_size
 
 // Zero-copy view of one raw INT3 expert (weights_prepacked == 0, block_size in {32, 64, 128}).
 struct Int3ExpertView {
-  const uint8_t* fc1_weights = nullptr;   // [2*inter, (hidden*3)/8] raw row-major
-  const uint16_t* fc1_scales = nullptr;   // [2*inter, hidden/block_size] row-major in FP16 or BF16
-  const uint16_t* fc1_bias = nullptr;     // optional [2*inter] in FP16 or BF16
-  const uint8_t* fc2_weights = nullptr;   // [hidden, (inter*3)/8] raw row-major
-  const uint16_t* fc2_scales = nullptr;   // [hidden, inter/block_size] row-major in FP16 or BF16
-  const uint16_t* fc2_bias = nullptr;     // optional [hidden] in FP16 or BF16
-  int64_t block_size = 32;                // 32, 64, or 128
+  const uint8_t* fc1_weights = nullptr;  // [2*inter, (hidden*3)/8] raw row-major
+  const uint16_t* fc1_scales = nullptr;  // [2*inter, hidden/block_size] row-major in FP16 or BF16
+  const uint16_t* fc1_bias = nullptr;    // optional [2*inter] in FP16 or BF16
+  const uint8_t* fc2_weights = nullptr;  // [hidden, (inter*3)/8] raw row-major
+  const uint16_t* fc2_scales = nullptr;  // [hidden, inter/block_size] row-major in FP16 or BF16
+  const uint16_t* fc2_bias = nullptr;    // optional [hidden] in FP16 or BF16
+  int64_t block_size = 32;               // 32, 64, or 128
   bool scale_is_bf16 = true;
   bool bias_is_bf16 = true;
 };

@@ -1175,9 +1175,7 @@ int main() {
                     fc1_w = rng.integers(
                         0, 256, size=(num_experts, 2 * inter_size, (hidden_size * 3) // 8), dtype=np.uint8
                     )
-                    fc2_w = rng.integers(
-                        0, 256, size=(num_experts, hidden_size, (inter_size * 3) // 8), dtype=np.uint8
-                    )
+                    fc2_w = rng.integers(0, 256, size=(num_experts, hidden_size, (inter_size * 3) // 8), dtype=np.uint8)
                 else:
                     pack_factor = 8 // bits
                     fc1_w = rng.integers(
@@ -1246,9 +1244,7 @@ int main() {
 
         prof_path = os.path.join(model_dir, "expert-profile.bin")
         pairs = [
-            (l_idx, (e * 3 + l_idx) % num_experts)
-            for e in range(num_experts)
-            for l_idx in range(len(layer_specs))
+            (l_idx, (e * 3 + l_idx) % num_experts) for e in range(num_experts) for l_idx in range(len(layer_specs))
         ]
         with open(prof_path, "wb") as pf:
             pf.write(
@@ -1321,7 +1317,7 @@ int main() {
             )
 
             rng = np.random.default_rng(202610)
-            for num_rows in (1, 2, 4, 16):
+            for num_rows in (1, 2, 4, 8, 16, 256):
                 x = rng.standard_normal((num_rows, 256), dtype=np.float32) * 0.5
                 r = rng.standard_normal((num_rows, 8), dtype=np.float32)
                 y_ref = self._run_bf16(sess_int4_ref, x, r)
