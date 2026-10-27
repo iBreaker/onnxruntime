@@ -479,11 +479,6 @@ bool DetectRuntimeAvx2CpuSupport() noexcept {
 
 std::atomic<bool> g_disable_avx512_for_testing{false};
 
-bool IsAvx512DisabledByEnv() noexcept {
-  const char* env = std::getenv("ORT_QMOE_CPU_DISABLE_AVX512");
-  return env != nullptr && env[0] == '1' && env[1] == '\0';
-}
-
 }  // namespace
 
 void SetDisableAvx512ForTesting(bool disable) noexcept {
@@ -508,16 +503,17 @@ bool CpuHasAvx512() {
   }
 #if QMOE_COMPILER_SUPPORTS_AVX512 && QMOE_SHARED_ARCH_X86_64
   static const bool has = []() {
+    const char* env = std::getenv("ORT_QMOE_CPU_DISABLE_AVX512");
+    if (env != nullptr && env[0] == '1' && env[1] == '\0') {
+      return false;
+    }
 #if defined(QMOE_SHARED_USE_MLAS)
     return MlasPlatformAvx512Supported();
 #else
     return DetectRuntimeAvx512CpuSupport();
 #endif
   }();
-  if (!has || IsAvx512DisabledByEnv()) {
-    return false;
-  }
-  return true;
+  return has;
 #else
   return false;
 #endif
@@ -2588,6 +2584,7 @@ int64_t qmoe_shared_block_bytes(int64_t hidden, int64_t inter) {
 
 int qmoe_shared_cpu_has_avx512(void) { return CpuHasAvx512() ? 1 : 0; }
 int qmoe_shared_cpu_has_avx2(void) { return CpuHasAvx2FmaF16c() ? 1 : 0; }
+void qmoe_shared_set_disable_avx512_for_testing(int disable) { SetDisableAvx512ForTesting(disable != 0); }
 
 int qmoe_shared_accepts_prepack_contract(int64_t weights_prepacked, int64_t block_size) {
   return IsAcceptedPrepackContract(weights_prepacked, block_size) ? 1 : 0;
