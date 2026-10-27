@@ -3475,12 +3475,21 @@ __global__ void __launch_bounds__(256, 4) FusedFc1GroupedFastKernel(
     Unpack8CenteredCodes<Bits>(w_u0, iter, lane, q_u0);
     const float sc_g0 = static_cast<float>(__ldg(&s_g0[blk]));
     const float sc_u0 = static_cast<float>(__ldg(&s_u0[blk]));
-    float sc_g1 = 0.0f, sc_u1 = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      q_g0[i] = static_cast<float>(static_cast<T>(q_g0[i] * sc_g0));
+      q_u0[i] = static_cast<float>(static_cast<T>(q_u0[i] * sc_u0));
+    }
     if (has_col1) {
       Unpack8CenteredCodes<Bits>(w_g1, iter, lane, q_g1);
       Unpack8CenteredCodes<Bits>(w_u1, iter, lane, q_u1);
-      sc_g1 = static_cast<float>(__ldg(&s_g1[blk]));
-      sc_u1 = static_cast<float>(__ldg(&s_u1[blk]));
+      const float sc_g1 = static_cast<float>(__ldg(&s_g1[blk]));
+      const float sc_u1 = static_cast<float>(__ldg(&s_u1[blk]));
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        q_g1[i] = static_cast<float>(static_cast<T>(q_g1[i] * sc_g1));
+        q_u1[i] = static_cast<float>(static_cast<T>(q_u1[i] * sc_u1));
+      }
     }
 #pragma unroll
     for (int r = 0; r < kGroupRows; ++r) {
@@ -3488,11 +3497,15 @@ __global__ void __launch_bounds__(256, 4) FusedFc1GroupedFastKernel(
         const uint4 u = *reinterpret_cast<const uint4*>(&s_input[static_cast<size_t>(r) * params.hidden + feature]);
         float4 a0, a1;
         UnpackVec8ToFloat4Pair<T>(u, a0, a1);
-        gate0[r] += Dot8DequantizedWeights<T>(a0, a1, q_g0, sc_g0);
-        up0[r] += Dot8DequantizedWeights<T>(a0, a1, q_u0, sc_u0);
+        gate0[r] += a0.x * q_g0[0] + a0.y * q_g0[1] + a0.z * q_g0[2] + a0.w * q_g0[3] +
+                    a1.x * q_g0[4] + a1.y * q_g0[5] + a1.z * q_g0[6] + a1.w * q_g0[7];
+        up0[r] += a0.x * q_u0[0] + a0.y * q_u0[1] + a0.z * q_u0[2] + a0.w * q_u0[3] +
+                  a1.x * q_u0[4] + a1.y * q_u0[5] + a1.z * q_u0[6] + a1.w * q_u0[7];
         if (has_col1) {
-          gate1[r] += Dot8DequantizedWeights<T>(a0, a1, q_g1, sc_g1);
-          up1[r] += Dot8DequantizedWeights<T>(a0, a1, q_u1, sc_u1);
+          gate1[r] += a0.x * q_g1[0] + a0.y * q_g1[1] + a0.z * q_g1[2] + a0.w * q_g1[3] +
+                      a1.x * q_g1[4] + a1.y * q_g1[5] + a1.z * q_g1[6] + a1.w * q_g1[7];
+          up1[r] += a0.x * q_u1[0] + a0.y * q_u1[1] + a0.z * q_u1[2] + a0.w * q_u1[3] +
+                    a1.x * q_u1[4] + a1.y * q_u1[5] + a1.z * q_u1[6] + a1.w * q_u1[7];
         }
       }
     }
@@ -3598,10 +3611,13 @@ __global__ void __launch_bounds__(256, 3) Fc2GroupedFastKernel(
     float q0[8], q1[8];
     Unpack8CenteredCodes128<Bits>(w0_ptr, iter, sub_lane, q0);
     const float sc0 = static_cast<float>(__ldg(&s0_ptr[blk]));
-    float sc1 = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) q0[i] = static_cast<float>(static_cast<T>(q0[i] * sc0));
     if (has_col1) {
       Unpack8CenteredCodes128<Bits>(w1_ptr, iter, sub_lane, q1);
-      sc1 = static_cast<float>(__ldg(&s1_ptr[blk]));
+      const float sc1 = static_cast<float>(__ldg(&s1_ptr[blk]));
+#pragma unroll
+      for (int i = 0; i < 8; ++i) q1[i] = static_cast<float>(static_cast<T>(q1[i] * sc1));
     }
 #pragma unroll
     for (int r = 0; r < kGroupRows; ++r) {
@@ -3609,17 +3625,24 @@ __global__ void __launch_bounds__(256, 3) Fc2GroupedFastKernel(
         const float* row_act = s_act + static_cast<size_t>(r) * params.intermediate + feature;
         const float4 a0 = *reinterpret_cast<const float4*>(row_act);
         const float4 a1 = *reinterpret_cast<const float4*>(row_act + 4);
-        v0[r] += Dot8DequantizedWeights<T>(a0, a1, q0, sc0);
-        if (has_col1) v1[r] += Dot8DequantizedWeights<T>(a0, a1, q1, sc1);
+        v0[r] += a0.x * q0[0] + a0.y * q0[1] + a0.z * q0[2] + a0.w * q0[3] +
+                 a1.x * q0[4] + a1.y * q0[5] + a1.z * q0[6] + a1.w * q0[7];
+        if (has_col1) {
+          v1[r] += a0.x * q1[0] + a0.y * q1[1] + a0.z * q1[2] + a0.w * q1[3] +
+                   a1.x * q1[4] + a1.y * q1[5] + a1.z * q1[6] + a1.w * q1[7];
+        }
       }
     }
     if (has_col2) {
       Unpack8CenteredCodes128<Bits>(w2_ptr, iter, sub_lane, q0);
       const float sc2 = static_cast<float>(__ldg(&s2_ptr[blk]));
-      float sc3 = 0.0f;
+#pragma unroll
+      for (int i = 0; i < 8; ++i) q0[i] = static_cast<float>(static_cast<T>(q0[i] * sc2));
       if (has_col3) {
         Unpack8CenteredCodes128<Bits>(w3_ptr, iter, sub_lane, q1);
-        sc3 = static_cast<float>(__ldg(&s3_ptr[blk]));
+        const float sc3 = static_cast<float>(__ldg(&s3_ptr[blk]));
+#pragma unroll
+        for (int i = 0; i < 8; ++i) q1[i] = static_cast<float>(static_cast<T>(q1[i] * sc3));
       }
 #pragma unroll
       for (int r = 0; r < kGroupRows; ++r) {
@@ -3627,8 +3650,12 @@ __global__ void __launch_bounds__(256, 3) Fc2GroupedFastKernel(
           const float* row_act = s_act + static_cast<size_t>(r) * params.intermediate + feature;
           const float4 a0 = *reinterpret_cast<const float4*>(row_act);
           const float4 a1 = *reinterpret_cast<const float4*>(row_act + 4);
-          v2[r] += Dot8DequantizedWeights<T>(a0, a1, q0, sc2);
-          if (has_col3) v3[r] += Dot8DequantizedWeights<T>(a0, a1, q1, sc3);
+          v2[r] += a0.x * q0[0] + a0.y * q0[1] + a0.z * q0[2] + a0.w * q0[3] +
+                   a1.x * q0[4] + a1.y * q0[5] + a1.z * q0[6] + a1.w * q0[7];
+          if (has_col3) {
+            v3[r] += a0.x * q1[0] + a0.y * q1[1] + a0.z * q1[2] + a0.w * q1[3] +
+                     a1.x * q1[4] + a1.y * q1[5] + a1.z * q1[6] + a1.w * q1[7];
+          }
         }
       }
     }
@@ -3673,6 +3700,10 @@ cudaError_t LaunchInt3Typed(const Int3MoeParams& params, cudaStream_t stream) {
                                   : (static_cast<size_t>(params.rows) * params.top_k);
   const size_t fc1_smem = static_cast<size_t>(params.hidden) * sizeof(float);
   const size_t fc2_smem = static_cast<size_t>(params.intermediate) * sizeof(float);
+  const size_t max_grouped_tiles = (total_routes + 7) / 8 + static_cast<size_t>(params.num_experts);
+  const bool routes_fit_grid =
+      (total_routes <= 65535 && params.rows <= 65535) ||
+      (params.grouped_workspace != nullptr && total_routes >= 32 && max_grouped_tiles <= 65535);
   const bool can_use_fast =
       params.fc2_partial != nullptr &&
       params.fc1.zeros == nullptr && params.fc2.zeros == nullptr &&
@@ -3680,7 +3711,7 @@ cudaError_t LaunchInt3Typed(const Int3MoeParams& params, cudaStream_t stream) {
       params.block_size >= 8 && params.block_size % 8 == 0 &&
       (reinterpret_cast<uintptr_t>(params.fc1.weights) & 3u) == 0 &&
       (reinterpret_cast<uintptr_t>(params.fc2.weights) & 3u) == 0 &&
-      total_routes <= 65535 && params.rows <= 65535 &&
+      routes_fit_grid &&
       fc1_smem <= 48 * 1024 && fc2_smem <= 48 * 1024;
 
   if (can_use_fast) {
