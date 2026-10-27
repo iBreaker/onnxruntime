@@ -93,6 +93,7 @@ void Avx512HalfBitsToFloatRow(const uint16_t* src, float* dst, int64_t count);
 void Avx512FloatToHalfBitsRow(const float* src, uint16_t* dst, int64_t count);
 void Avx512BFloat16BitsToFloatRow(const uint16_t* src, float* dst, int64_t count);
 void Avx512FloatToBFloat16BitsRow(const float* src, uint16_t* dst, int64_t count);
+void SetFp4Group8MaskOverride(int mask) noexcept;
 }  // namespace detail
 #endif
 
@@ -390,6 +391,14 @@ bool CpuHasAvx512() {
   return has;
 #else
   return false;
+#endif
+}
+
+void SetFp4Group8MaskForTesting(int mask) noexcept {
+#if QMOE_COMPILER_SUPPORTS_AVX512
+  detail::SetFp4Group8MaskOverride(mask);
+#else
+  (void)mask;
 #endif
 }
 
@@ -1640,7 +1649,7 @@ bool ValidateExpertStorageRange(int64_t num_experts, size_t stride, uint64_t ext
 
 bool MakeExpertBlockLayout(int64_t hidden, int64_t inter, ExpertBlockLayout* layout) {
   if (layout == nullptr || hidden <= 0 || inter <= 0) return false;
-  // Enforce backend int32 index limits and prevent 2 * inter overflow before multiplication (F12).
+  // Enforce backend int32 index limits and prevent 2 * inter overflow before multiplication.
   if (hidden > static_cast<int64_t>(std::numeric_limits<int>::max()) ||
       inter > static_cast<int64_t>(std::numeric_limits<int>::max() / 2)) {
     return false;

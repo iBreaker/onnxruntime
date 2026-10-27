@@ -305,6 +305,400 @@ TEST(QMoESharedLayoutTest, Avx512Fp4ScalesMatchScalarIncludingNonfiniteValues) {
   }
 }
 
+// The NVFP4/MXFP4 kernels read weights as [N, K/2] bytes in natural K order (the low nibble holds the even k) and
+// activations permuted by ReorderNvfp4ActivationRow. The reference below dequantizes every weight in natural order
+// without the reorder helpers or the library decode tables, so swapped nibble lanes, wrong block-scale selection or
+// a wrong activation permutation change the result. Rounding points mirror the kernels: the scale is rounded after
+// the global-scale multiply and each weight after the E2M1 multiply, both to BF16 or FP16.
+
+class Fp4Rng {
+ public:
+  explicit Fp4Rng(uint64_t seed) : state_(seed) {}
+  uint32_t Below(uint32_t bound) {
+    state_ = state_ * 6364136223846793005ULL + 1442695040888963407ULL;
+    return static_cast<uint32_t>(state_ >> 33) % bound;
+  }
+
+ private:
+  uint64_t state_;
+};
+
+// Forces the AVX-512 FP4 column tiling (0xF = 8-column tiles for every row tile) for the current scope.
+class ScopedFp4Group8Mask {
+ public:
+  explicit ScopedFp4Group8Mask(int mask) { shared::SetFp4Group8MaskForTesting(mask); }
+  ~ScopedFp4Group8Mask() { shared::SetFp4Group8MaskForTesting(-1); }
+  ScopedFp4Group8Mask(const ScopedFp4Group8Mask&) = delete;
+  ScopedFp4Group8Mask& operator=(const ScopedFp4Group8Mask&) = delete;
+};
+
+// Round-to-nearest-even onto a binary format with `mantissa_bits` fraction bits; magnitudes below
+// 2^min_exponent land on the subnormal grid. Test inputs never reach the overflow range.
+double RoundToFormat(double v, int mantissa_bits, int min_exponent) {
+  if (v == 0.0 || !std::isfinite(v)) return v;
+  int exponent = 0;
+  std::frexp(v, &exponent);  // v = f * 2^exponent with 0.5 <= |f| < 1.
+  const double quantum = std::ldexp(1.0, std::max(exponent - 1, min_exponent) - mantissa_bits);
+  return std::nearbyint(v / quantum) * quantum;
+}
+
+double RoundBf16Reference(double v) { return RoundToFormat(v, 7, -126); }
+double RoundFp16Reference(double v) { return RoundToFormat(v, 10, -14); }
+
+constexpr double kFp4E2M1Reference[16] = {0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+                                          -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0};
+
+// Finite E4M3FN codes only (0x7F and 0xFF are NaN).
+double DecodeE4M3FnReference(uint8_t code) {
+  const int exponent = (code >> 3) & 0xF;
+  const int mantissa = code & 0x7;
+  const double magnitude = exponent == 0 ? std::ldexp(static_cast<double>(mantissa), -9)
+                                         : std::ldexp(static_cast<double>(8 + mantissa), exponent - 10);
+  return (code & 0x80) ? -magnitude : magnitude;
+}
+
+struct Fp4Matrix {
+  int64_t rows = 0;
+  int64_t cols = 0;  // K
+  bool mxfp4 = false;
+  std::vector<uint8_t> weights;  // [rows, cols / 2], natural K order.
+  std::vector<uint8_t> scales;   // [rows, cols / block]: E4M3 per 16 (NVFP4) or E8M0 per 32 (MXFP4).
+
+  int64_t Block() const { return mxfp4 ? 32 : 16; }
+};
+
+// Random nibbles and scale codes. `narrow_scales` limits the scale exponents so that, for activations on the k/8
+// grid in [-1, 1] and K <= 256, every dot product (and partial sum) is a multiple of 2^-11 below 2^12: float
+// accumulation is then exact in any order and an FC1 result equals the double reference bit for bit.
+Fp4Matrix MakeFp4Matrix(Fp4Rng& rng, int64_t rows, int64_t cols, bool mxfp4, bool narrow_scales) {
+  Fp4Matrix mat;
+  mat.rows = rows;
+  mat.cols = cols;
+  mat.mxfp4 = mxfp4;
+  mat.weights.resize(static_cast<size_t>(rows * cols / 2));
+  for (auto& byte : mat.weights) byte = static_cast<uint8_t>(rng.Below(256));
+  mat.scales.resize(static_cast<size_t>(rows * cols / mat.Block()));
+  for (auto& scale : mat.scales) {
+    if (mxfp4) {
+      scale = static_cast<uint8_t>(narrow_scales ? 125 + rng.Below(3) : 110 + rng.Below(26));
+    } else if (narrow_scales) {
+      scale = static_cast<uint8_t>(((4 + rng.Below(3)) << 3) | rng.Below(8));
+    } else {
+      do {
+        scale = static_cast<uint8_t>(rng.Below(256));
+      } while ((scale & 0x7F) == 0x7F);
+    }
+  }
+  return mat;
+}
+
+// Natural-order [rows, cols] dequantized weights, rounded where the kernels round them.
+std::vector<double> DequantizeFp4(const Fp4Matrix& mat, float global_scale, bool round_bf16) {
+  const auto round_fn = round_bf16 ? RoundBf16Reference : RoundFp16Reference;
+  std::vector<double> dequantized(static_cast<size_t>(mat.rows * mat.cols));
+  for (int64_t n = 0; n < mat.rows; ++n) {
+    for (int64_t k = 0; k < mat.cols; ++k) {
+      const uint8_t byte = mat.weights[static_cast<size_t>(n * (mat.cols / 2) + k / 2)];
+      const uint8_t nibble = (k & 1) ? static_cast<uint8_t>(byte >> 4) : static_cast<uint8_t>(byte & 0x0F);
+      const uint8_t code = mat.scales[static_cast<size_t>(n * (mat.cols / mat.Block()) + k / mat.Block())];
+      const double decoded = mat.mxfp4 ? std::ldexp(1.0, code - 127) : DecodeE4M3FnReference(code);
+      const double scale = round_fn(static_cast<double>(static_cast<float>(decoded) * global_scale));
+      dequantized[static_cast<size_t>(n * mat.cols + k)] = round_fn(kFp4E2M1Reference[nibble] * scale);
+    }
+  }
+  return dequantized;
+}
+
+struct Fp4Bias {
+  std::vector<double> values;  // Multiples of 1/16 in [-2, 2], exact in BF16 and FP16.
+  std::vector<uint16_t> bits;
+};
+
+Fp4Bias MakeFp4Bias(Fp4Rng& rng, int64_t count, bool bf16) {
+  Fp4Bias bias;
+  for (int64_t i = 0; i < count; ++i) {
+    const float value = static_cast<float>(static_cast<int>(rng.Below(65)) - 32) / 16.0f;
+    bias.values.push_back(static_cast<double>(value));
+    bias.bits.push_back(bf16 ? shared::FloatToBFloat16(value) : shared::FloatToHalf(value));
+  }
+  return bias;
+}
+
+struct DotReference {
+  double value = 0.0;
+  double abs_sum = 0.0;  // Scale for the float accumulation error bound.
+};
+
+template <typename T>
+DotReference ReferenceDot(const double* weights, const T* x, int64_t k, double bias) {
+  DotReference dot;
+  dot.value = bias;
+  dot.abs_sum = std::fabs(bias);
+  for (int64_t i = 0; i < k; ++i) {
+    const double term = weights[i] * static_cast<double>(x[i]);
+    dot.value += term;
+    dot.abs_sum += std::fabs(term);
+  }
+  return dot;
+}
+
+constexpr double kFp4RelativeTolerance = 5e-5;  // Float accumulation of up to 256 terms stays well below this.
+constexpr float kFp4Sentinel = 12345.0f;
+
+TEST(QMoESharedLayoutTest, Fp4GemmMatchesNaturalOrderReference) {
+  Fp4Rng rng(0x5eed0001);
+  constexpr int64_t kPadding = 3;
+  int combo = 0;
+  for (bool mxfp4 : {false, true}) {
+    for (bool round_bf16 : {true, false}) {
+      for (int64_t k : {32, 64, 96, 160, 256}) {
+        for (int64_t n_total : {1, 5, 8, 12, 17, 33}) {
+          for (int64_t m : {1, 2, 3, 4, 7, 8}) {
+            // Rotate the global scale and the bias kind (none, BF16, FP16) instead of crossing them.
+            const float global_scale = (combo % 2 == 0) ? 0.3f : 1.0f;
+            const int bias_kind = combo % 3;
+            ++combo;
+            const Fp4Matrix mat = MakeFp4Matrix(rng, n_total, k, mxfp4, /*narrow_scales=*/false);
+            const std::vector<double> dequantized = DequantizeFp4(mat, global_scale, round_bf16);
+            std::vector<float> x(static_cast<size_t>(m * k));
+            for (auto& value : x) value = static_cast<float>(static_cast<int>(rng.Below(4001)) - 2000) / 1000.0f;
+            std::vector<float> x_reordered(x.size());
+            for (int64_t r = 0; r < m; ++r) {
+              shared::ReorderNvfp4ActivationRow(x.data() + r * k, x_reordered.data() + r * k, k);
+            }
+            Fp4Bias bias;
+            if (bias_kind != 0) bias = MakeFp4Bias(rng, n_total, bias_kind == 1);
+
+            std::vector<std::pair<int64_t, int64_t>> ranges{{0, n_total}};
+            if (n_total >= 3) ranges.emplace_back(1, n_total - 1);
+            if (n_total >= 8) ranges.emplace_back(n_total / 2, n_total);
+            for (const auto& [begin, end] : ranges) {
+              // 0: scalar, 1: AVX-512 with 4-column tiles, 2: AVX-512 with 8-column tiles.
+              for (int variant = 0; variant < 3; ++variant) {
+                if (variant != 0 && !shared::CpuHasAvx512()) continue;
+                SCOPED_TRACE(testing::Message()
+                             << "mxfp4=" << mxfp4 << " bf16=" << round_bf16 << " k=" << k << " n_total=" << n_total
+                             << " m=" << m << " range=[" << begin << "," << end << ") variant=" << variant
+                             << " global_scale=" << global_scale << " bias_kind=" << bias_kind);
+                ScopedFp4Group8Mask group8(variant == 2 ? 0xF : 0x0);
+                const int64_t width = end - begin;
+                const int64_t stride = width + kPadding;
+                std::vector<float> out(static_cast<size_t>(m * stride), kFp4Sentinel);
+                const auto gemm = mxfp4 ? shared::Mxfp4GemmRange : shared::Nvfp4GemmRange;
+                gemm(mat.weights.data(), mat.scales.data(), global_scale,
+                     bias.bits.empty() ? nullptr : bias.bits.data(), bias_kind != 2, n_total, k, x_reordered.data(),
+                     m, out.data(), stride, begin, end, variant == 0, round_bf16);
+                for (int64_t r = 0; r < m; ++r) {
+                  for (int64_t c = 0; c < stride; ++c) {
+                    const float actual = out[static_cast<size_t>(r * stride + c)];
+                    if (c >= width) {
+                      ASSERT_EQ(actual, kFp4Sentinel) << "write past the requested range, row=" << r;
+                      continue;
+                    }
+                    const int64_t n = begin + c;
+                    const DotReference expected =
+                        ReferenceDot(&dequantized[static_cast<size_t>(n * k)], &x[static_cast<size_t>(r * k)], k,
+                                     bias.values.empty() ? 0.0 : bias.values[static_cast<size_t>(n)]);
+                    ASSERT_NEAR(actual, expected.value, kFp4RelativeTolerance * expected.abs_sum)
+                        << "row=" << r << " column=" << n;
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+enum class Fp4Boundary {
+  kBf16,
+  kFp16,
+  kNone,
+};
+
+TEST(QMoESharedLayoutTest, Fp4ExpertForwardMatchesNaturalOrderReference) {
+  Fp4Rng rng(0x5eed0002);
+  const std::array<std::pair<int64_t, int64_t>, 5> shapes{{{32, 32}, {64, 32}, {32, 64}, {96, 64}, {128, 96}}};
+  const std::array<shared::SwiGluParams, 2> activations{
+      shared::SwiGluParams{1.702f, 1.0f, 7.0f},
+      shared::SwiGluParams{1.0f, 0.0f, std::numeric_limits<float>::infinity()}};
+  const std::array<float, 3> global_scales{0.5f, 1.0f, 2.0f};
+  int combo = 0;
+  for (bool mxfp4 : {false, true}) {
+    for (Fp4Boundary boundary : {Fp4Boundary::kBf16, Fp4Boundary::kFp16, Fp4Boundary::kNone}) {
+      for (const auto& [hidden, inter] : shapes) {
+        for (int64_t m : {1, 3, 8}) {
+          for (bool apply_fc2_bias : {false, true}) {
+            for (const auto& swiglu : activations) {
+              const bool act_bf16 = boundary == Fp4Boundary::kBf16;
+              const bool act_fp16 = boundary == Fp4Boundary::kFp16;
+              // Nvfp4ExpertForward rounds scales and weights to BF16 unless the FP16 boundary is selected.
+              const bool weights_bf16 = !act_fp16;
+              const float fc1_scale = global_scales[static_cast<size_t>(combo % 3)];
+              const float fc2_scale = global_scales[static_cast<size_t>((combo / 3) % 3)];
+              const bool fc1_has_bias = (combo % 2) == 0;
+              ++combo;
+              SCOPED_TRACE(testing::Message()
+                           << "mxfp4=" << mxfp4 << " boundary=" << static_cast<int>(boundary) << " hidden=" << hidden
+                           << " inter=" << inter << " m=" << m << " fc2_bias=" << apply_fc2_bias
+                           << " alpha=" << swiglu.alpha << " limit=" << swiglu.limit
+                           << " fc1_scale=" << fc1_scale << " fc2_scale=" << fc2_scale << " fc1_bias=" << fc1_has_bias);
+
+              const Fp4Matrix fc1 = MakeFp4Matrix(rng, 2 * inter, hidden, mxfp4, /*narrow_scales=*/true);
+              const Fp4Matrix fc2 = MakeFp4Matrix(rng, hidden, inter, mxfp4, /*narrow_scales=*/true);
+              const Fp4Bias bias1 = MakeFp4Bias(rng, 2 * inter, weights_bf16);
+              const Fp4Bias bias2 = MakeFp4Bias(rng, hidden, weights_bf16);
+              std::vector<float> x(static_cast<size_t>(m * hidden));
+              for (auto& value : x) value = static_cast<float>(static_cast<int>(rng.Below(17)) - 8) / 8.0f;
+
+              shared::Nvfp4ExpertView view;
+              view.fc1_weights = fc1.weights.data();
+              view.fc1_scales = fc1.scales.data();
+              view.fc1_global_scale = fc1_scale;
+              view.fc1_bias = fc1_has_bias ? bias1.bits.data() : nullptr;
+              view.fc2_weights = fc2.weights.data();
+              view.fc2_scales = fc2.scales.data();
+              view.fc2_global_scale = fc2_scale;
+              view.fc2_bias = bias2.bits.data();
+              view.bias_is_bf16 = weights_bf16;
+              view.is_mxfp4 = mxfp4;
+
+              // FC1 interleaves gate (even) and up (odd) columns; the SwiGLU result is the natural-order FC2 input.
+              const std::vector<double> w1 = DequantizeFp4(fc1, fc1_scale, weights_bf16);
+              const std::vector<double> w2 = DequantizeFp4(fc2, fc2_scale, weights_bf16);
+              std::vector<double> act(static_cast<size_t>(m * inter));
+              for (int64_t r = 0; r < m; ++r) {
+                for (int64_t j = 0; j < inter; ++j) {
+                  const size_t gate_row = static_cast<size_t>(2 * j * hidden);
+                  const size_t up_row = static_cast<size_t>((2 * j + 1) * hidden);
+                  const DotReference gate_dot = ReferenceDot(&w1[gate_row], &x[static_cast<size_t>(r * hidden)], hidden,
+                                                             fc1_has_bias ? bias1.values[static_cast<size_t>(2 * j)] : 0.0);
+                  const DotReference up_dot = ReferenceDot(&w1[up_row], &x[static_cast<size_t>(r * hidden)], hidden,
+                                                           fc1_has_bias ? bias1.values[static_cast<size_t>(2 * j + 1)] : 0.0);
+                  float gate = static_cast<float>(gate_dot.value);
+                  float value = static_cast<float>(up_dot.value);
+                  ASSERT_EQ(static_cast<double>(gate), gate_dot.value) << "FC1 reference must be exact in float";
+                  ASSERT_EQ(static_cast<double>(value), up_dot.value) << "FC1 reference must be exact in float";
+                  if (std::isfinite(swiglu.limit)) {
+                    gate = std::min(gate, swiglu.limit);
+                    value = std::clamp(value, -swiglu.limit, swiglu.limit);
+                  }
+                  const float activated = gate / (1.0f + std::exp(-swiglu.alpha * gate)) * (value + swiglu.beta);
+                  act[static_cast<size_t>(r * inter + j)] = act_bf16   ? RoundBf16Reference(activated)
+                                                            : act_fp16 ? RoundFp16Reference(activated)
+                                                                       : static_cast<double>(activated);
+                }
+              }
+              std::vector<DotReference> expected(static_cast<size_t>(m * hidden));
+              for (int64_t r = 0; r < m; ++r) {
+                for (int64_t c = 0; c < hidden; ++c) {
+                  expected[static_cast<size_t>(r * hidden + c)] =
+                      ReferenceDot(&w2[static_cast<size_t>(c * inter)], &act[static_cast<size_t>(r * inter)], inter,
+                                   apply_fc2_bias ? bias2.values[static_cast<size_t>(c)] : 0.0);
+                }
+              }
+
+              // 0: scalar, 1: AVX-512 with 4-column tiles, 2: AVX-512 with 8-column tiles.
+              for (int variant = 0; variant < 3; ++variant) {
+                if (variant != 0 && !shared::CpuHasAvx512()) continue;
+                ScopedFp4Group8Mask group8(variant == 2 ? 0xF : 0x0);
+                std::vector<float> out(static_cast<size_t>(m * hidden), kFp4Sentinel);
+                ASSERT_TRUE(shared::Nvfp4ExpertForward(hidden, inter, view, x.data(), m, swiglu, out.data(),
+                                                       variant == 0, apply_fc2_bias, act_bf16, act_fp16))
+                    << "variant=" << variant;
+                for (size_t i = 0; i < out.size(); ++i) {
+                  ASSERT_NEAR(out[i], expected[i].value, kFp4RelativeTolerance * expected[i].abs_sum)
+                      << "variant=" << variant << " row=" << i / static_cast<size_t>(hidden)
+                      << " column=" << i % static_cast<size_t>(hidden);
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+TEST(QMoESharedLayoutTest, Fp4ExpertRangeSplitMatchesWholeForward) {
+  // Worker-style splitting: FC1 over even column ranges and FC2 over arbitrary column ranges must agree with the
+  // whole-expert call (within accumulation-order noise, since tile boundaries differ between the two).
+  Fp4Rng rng(0x5eed0003);
+  constexpr int64_t hidden = 96;
+  constexpr int64_t inter = 96;
+  constexpr int64_t m = 5;
+  const shared::SwiGluParams swiglu{1.702f, 1.0f, 7.0f};
+  for (bool mxfp4 : {false, true}) {
+    SCOPED_TRACE(testing::Message() << "mxfp4=" << mxfp4);
+    const Fp4Matrix fc1 = MakeFp4Matrix(rng, 2 * inter, hidden, mxfp4, /*narrow_scales=*/true);
+    const Fp4Matrix fc2 = MakeFp4Matrix(rng, hidden, inter, mxfp4, /*narrow_scales=*/true);
+    const Fp4Bias bias1 = MakeFp4Bias(rng, 2 * inter, true);
+    const Fp4Bias bias2 = MakeFp4Bias(rng, hidden, true);
+    shared::Nvfp4ExpertView view;
+    view.fc1_weights = fc1.weights.data();
+    view.fc1_scales = fc1.scales.data();
+    view.fc1_global_scale = 1.0f;
+    view.fc1_bias = bias1.bits.data();
+    view.fc2_weights = fc2.weights.data();
+    view.fc2_scales = fc2.scales.data();
+    view.fc2_global_scale = 0.5f;
+    view.fc2_bias = bias2.bits.data();
+    view.is_mxfp4 = mxfp4;
+    std::vector<float> x(static_cast<size_t>(m * hidden));
+    for (auto& value : x) value = static_cast<float>(static_cast<int>(rng.Below(17)) - 8) / 8.0f;
+
+    std::vector<float> whole(static_cast<size_t>(m * hidden), kFp4Sentinel);
+    ASSERT_TRUE(shared::Nvfp4ExpertForward(hidden, inter, view, x.data(), m, swiglu, whole.data(),
+                                           /*force_scalar=*/false, /*apply_fc2_bias=*/true));
+
+    std::vector<float> x_reordered(x.size());
+    for (int64_t r = 0; r < m; ++r) {
+      shared::ReorderNvfp4ActivationRow(x.data() + r * hidden, x_reordered.data() + r * hidden, hidden);
+    }
+    std::vector<float> inter_reordered(static_cast<size_t>(m * inter), kFp4Sentinel);
+    const std::array<int64_t, 5> fc1_splits{0, 50, 66, 128, 2 * inter};
+    for (size_t i = 0; i + 1 < fc1_splits.size(); ++i) {
+      shared::Nvfp4Fc1SwiGluRange(hidden, inter, view, x_reordered.data(), m, swiglu, inter_reordered.data(),
+                                  fc1_splits[i], fc1_splits[i + 1], false, true, false);
+    }
+    std::vector<float> split(static_cast<size_t>(m * hidden), kFp4Sentinel);
+    const std::array<int64_t, 5> fc2_splits{0, 7, 40, 41, hidden};
+    for (size_t i = 0; i + 1 < fc2_splits.size(); ++i) {
+      shared::Nvfp4Fc2Range(hidden, inter, view, inter_reordered.data(), m, split.data(), fc2_splits[i],
+                            fc2_splits[i + 1], false, true, true);
+    }
+    for (size_t i = 0; i < split.size(); ++i) {
+      ASSERT_NEAR(split[i], whole[i], 1e-5 * (std::fabs(whole[i]) + 1.0)) << "element " << i;
+    }
+  }
+}
+
+TEST(QMoESharedLayoutTest, Fp4ExpertForwardRejectsUnsupportedShapes) {
+  Fp4Rng rng(0x5eed0004);
+  const Fp4Matrix fc1 = MakeFp4Matrix(rng, 64, 32, false, true);
+  const Fp4Matrix fc2 = MakeFp4Matrix(rng, 32, 32, false, true);
+  shared::Nvfp4ExpertView view;
+  view.fc1_weights = fc1.weights.data();
+  view.fc1_scales = fc1.scales.data();
+  view.fc2_weights = fc2.weights.data();
+  view.fc2_scales = fc2.scales.data();
+  const shared::SwiGluParams swiglu{1.0f, 0.0f, std::numeric_limits<float>::infinity()};
+  std::vector<float> x(static_cast<size_t>(shared::kMaxRowsPerCall + 1) * 48, 0.5f);
+  std::vector<float> out(static_cast<size_t>(shared::kMaxRowsPerCall + 1) * 48, 0.0f);
+  EXPECT_TRUE(shared::Nvfp4ExpertForward(32, 32, view, x.data(), 1, swiglu, out.data()));
+  EXPECT_TRUE(shared::Nvfp4ExpertForward(32, 32, view, x.data(), shared::kMaxRowsPerCall, swiglu, out.data()));
+  EXPECT_FALSE(shared::Nvfp4ExpertForward(32, 32, view, x.data(), 0, swiglu, out.data()));
+  EXPECT_FALSE(shared::Nvfp4ExpertForward(32, 32, view, x.data(), shared::kMaxRowsPerCall + 1, swiglu, out.data()));
+  EXPECT_FALSE(shared::Nvfp4ExpertForward(48, 32, view, x.data(), 1, swiglu, out.data()));
+  EXPECT_FALSE(shared::Nvfp4ExpertForward(32, 48, view, x.data(), 1, swiglu, out.data()));
+  EXPECT_FALSE(shared::Nvfp4ExpertForward(0, 32, view, x.data(), 1, swiglu, out.data()));
+  shared::Nvfp4ExpertView missing_fc2 = view;
+  missing_fc2.fc2_weights = nullptr;
+  EXPECT_FALSE(shared::Nvfp4ExpertForward(32, 32, missing_fc2, x.data(), 1, swiglu, out.data()));
+}
+
 #if defined(__linux__)
 TEST(QMoESharedLayoutTest, MappedStoreHonorsPinsAndRollsBackFailedGroups) {
   constexpr size_t stride = shared::kBankAlignment;

@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -584,7 +585,15 @@ void Fp4Group4Avx512(const uint8_t* w_base, const uint8_t* next_w_base, const ui
   store_col(3, acc3_0, acc3_1, acc3_2, acc3_3);
 }
 
+// Negative defers to ORT_QMOE_FP4_GROUP8_MASK; a value in [0, 0xF] is a test override (see
+// SetFp4Group8MaskForTesting) so Group4 and Group8 tiles can be exercised within one process.
+std::atomic<int> g_fp4_group8_mask_override{-1};
+
 inline int GetFp4Group8Mask() noexcept {
+  const int override_mask = g_fp4_group8_mask_override.load(std::memory_order_relaxed);
+  if (override_mask >= 0) {
+    return override_mask & 0xF;
+  }
   static const int mask = []() {
     const char* env = std::getenv("ORT_QMOE_FP4_GROUP8_MASK");
     if (env != nullptr && *env != '\0') {
@@ -713,6 +722,10 @@ void Avx512Mxfp4GemmRange(const uint8_t* weights, const uint8_t* block_scales, f
       r += 1;
     }
   }
+}
+
+void SetFp4Group8MaskOverride(int mask) noexcept {
+  g_fp4_group8_mask_override.store(mask, std::memory_order_relaxed);
 }
 
 void Avx512HalfBitsToFloatRow(const uint16_t* src, float* dst, int64_t count) {

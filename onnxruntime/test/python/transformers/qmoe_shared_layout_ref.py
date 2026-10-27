@@ -1,5 +1,5 @@
 # SharedExpertBlockV1 numpy reference: packer, block assembly, and float64 expert forward.
-# Layout is documented in dev/docs/design/qwen38_flash_next_int4_24g_offload.md.
+# The layout mirrors SharedExpertBlockV1 as declared in contrib_ops/cpu/moe/qmoe_shared_layout.h.
 from __future__ import annotations
 
 import numpy as np

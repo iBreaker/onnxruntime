@@ -1,5 +1,5 @@
-// SharedExpertBlockV1 and NVFP4 RowMajor CPU/GPU shared expert layouts and kernels.
-// See dev/docs/qmoe_offload_design_v3.md (Sections 5, 6, 8, and F12).
+// SharedExpertBlockV1 and NVFP4 RowMajor CPU/GPU shared expert layouts and kernels, plus the
+// tensor-backed and file-backed ExpertStore implementations that serve expert blocks.
 // This header is intentionally independent of ORT internal headers so it can be unit-tested standalone.
 #pragma once
 
@@ -30,7 +30,7 @@ bool IsAcceptedPrepackContract(int64_t weights_prepacked, int64_t block_size);
 bool IsAcceptedNvfp4PrepackContract(int64_t weights_prepacked, int64_t block_size);
 bool IsAcceptedMxfp4PrepackContract(int64_t weights_prepacked, int64_t block_size);
 
-// Standalone checked arithmetic helpers (F12).
+// Standalone overflow-checked arithmetic helpers for layout and storage size computations.
 inline bool CheckedMulSize(size_t a, size_t b, size_t* out) noexcept {
   if (out == nullptr) return false;
   if (a != 0 && b > std::numeric_limits<size_t>::max() / a) return false;
@@ -53,7 +53,7 @@ inline bool CheckedAlignUp(size_t v, size_t alignment, size_t* out) noexcept {
   return true;
 }
 
-// Validates that E * stride and external [offset, offset + length) cannot overflow (F12).
+// Validates that E * stride and external [offset, offset + length) cannot overflow.
 bool ValidateExpertStorageRange(int64_t num_experts, size_t stride, uint64_t external_offset,
                                 uint64_t external_length, size_t* total_bytes = nullptr) noexcept;
 
@@ -65,7 +65,7 @@ bool IsFileBackedReadOnlyMapping(const void* data, size_t bytes) noexcept;
 // read-only regular-file mapping; returns the number of evicted bytes (0 for heap/anonymous memory).
 size_t EvictFileBackedHostPages(const void* data, size_t bytes) noexcept;
 
-// Lease descriptor recording actual pointer alignment alongside length and optional owner (F12 & Section 6).
+// Lease descriptor recording actual pointer alignment alongside length and optional owner.
 struct ExpertBlockLease {
   const uint8_t* data = nullptr;
   size_t length = 0;
@@ -81,7 +81,7 @@ struct ExpertKey {
   uint64_t weight_revision = 0;
 };
 
-// Zero-copy tensor-backed ExpertStore seam (v3 Section 6).
+// Zero-copy tensor-backed ExpertStore seam.
 class TensorExpertStore {
  public:
   TensorExpertStore() = default;
@@ -111,7 +111,7 @@ class TensorExpertStore {
 };
 
 // Asynchronous SSD-backed ExpertStore with bounded host RAM LRU cache, pin-counted leases,
-// and background generation-tagged prefetch worker (v3 Section 6, Section 10 & P3).
+// and background generation-tagged prefetch worker.
 class FileExpertStore {
  public:
   struct MappedBank {
@@ -211,7 +211,7 @@ struct ExpertBlockLayout {
   size_t stride = 0;
 };
 
-// Returns false if the shape cannot use the layout or any intermediate product overflows (F12).
+// Returns false if the shape cannot use the layout or any intermediate product overflows.
 bool MakeExpertBlockLayout(int64_t hidden, int64_t inter, ExpertBlockLayout* layout);
 
 // Byte offsets inside a contiguous NVFP4 row-major expert block (optional packed block mode).
@@ -372,6 +372,10 @@ void Mxfp4GemmRange(const uint8_t* weights, const uint8_t* block_scales, float g
                     int64_t n_begin, int64_t n_end, bool force_scalar = false,
                     bool round_scale_bf16 = true);
 
+// FC1 + SwiGLU for the FC1 output columns [n_begin, n_end) of the 2 * inter interleaved (gate, up) columns.
+// Preconditions: 1 <= m <= kMaxRowsPerCall (the per-chunk scratch is sized for it), and n_begin / n_end are even and
+// within [0, 2 * inter] so that every (gate, up) pair is computed together. Each call writes only the activations
+// j = n / 2 of its own range into inter_reordered ([m, inter]), so disjoint ranges can run concurrently.
 void Nvfp4Fc1SwiGluRange(int64_t hidden, int64_t inter, const Nvfp4ExpertView& view,
                          const float* x_reordered, int64_t m, const SwiGluParams& swiglu,
                          float* inter_reordered, int64_t n_begin, int64_t n_end,
@@ -391,6 +395,11 @@ bool Nvfp4ExpertForward(int64_t hidden, int64_t inter, const Nvfp4ExpertView& vi
 
 bool CompilerHasAvx512() noexcept;
 bool CpuHasAvx512();
+
+// Test hook for the AVX-512 FP4 kernels: bit (RT - 1) of `mask` enables the 8-column tile for RT-row tiles
+// (RT = 1..4), so Group4 and Group8 can both be exercised in one process. A negative value restores the default
+// (Group4, or ORT_QMOE_FP4_GROUP8_MASK). No effect when AVX-512 kernels are not compiled in.
+void SetFp4Group8MaskForTesting(int mask) noexcept;
 
 }  // namespace qmoe_shared
 }  // namespace contrib
