@@ -189,6 +189,44 @@ TEST(QMoESharedLayoutTest, PrefetchCoalescesDuplicatesRefreshesGenerationAndBoun
   std::filesystem::remove(tmp_path);
 }
 
+TEST(QMoESharedLayoutTest, PrefetchKeepsEarlierRequestsWhenQueueIsFullOfTheSameGeneration) {
+  constexpr size_t kStride = shared::kBankAlignment;
+  constexpr int64_t kNumExperts = 6;
+  const auto tmp_path = std::filesystem::temp_directory_path() / "ort_qmoe_prefetch_same_generation.bin";
+  {
+    std::vector<uint8_t> data(static_cast<size_t>(kNumExperts) * kStride);
+    for (int64_t e = 0; e < kNumExperts; ++e) {
+      std::fill_n(data.data() + static_cast<size_t>(e) * kStride, kStride, static_cast<uint8_t>(e + 10));
+    }
+    std::ofstream out(tmp_path, std::ios::binary | std::ios::trunc);
+    ASSERT_TRUE(out.is_open());
+    out.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
+  }
+
+  shared::FileExpertStore store;
+  constexpr size_t kCacheSlots = 2;
+  ASSERT_TRUE(store.Initialize(tmp_path.string().c_str(), 0, kNumExperts, kStride, kCacheSlots));
+  // Prefetch holds the store lock for the whole batch, so the worker only sees the final queue. Every request shares
+  // generation 1, i.e. none is staler than another: once the queue is full the earlier requests (served first by the
+  // worker) must be kept rather than displaced by later ones.
+  const std::array<int32_t, 6> batch{0, 1, 2, 3, 4, 5};
+  ASSERT_TRUE(store.Prefetch(batch.data(), batch.size(), 1));
+  store.WaitPrefetchIdle();
+
+  shared::ExpertBlockLease lease{};
+  for (int32_t e = 0; e < kNumExperts; ++e) {
+    const bool cached = store.TryAcquireCached(e, &lease);
+    EXPECT_EQ(cached, static_cast<size_t>(e) < kCacheSlots) << "expert " << e;
+    if (cached) {
+      EXPECT_EQ(lease.data[0], static_cast<uint8_t>(e + 10));
+      store.ReleaseLease(e);
+    }
+  }
+
+  store.Shutdown();
+  std::filesystem::remove(tmp_path);
+}
+
 TEST(QMoESharedLayoutTest, HalfConversionPreservesSignedZero) {
   const std::array<uint16_t, 2> bits{0x0000, 0x8000};
   for (bool scalar : {true, false}) {

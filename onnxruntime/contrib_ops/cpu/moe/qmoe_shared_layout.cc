@@ -1460,7 +1460,9 @@ bool FileExpertStore::Prefetch(const int32_t* expert_ids, size_t count, uint64_t
             victim_idx = k;
           }
         }
-        if (min_gen > generation) {
+        // Only a strictly newer request displaces a queued one. On a tie keep the queued request: WorkerLoop serves a
+        // generation in FIFO order, so replacing the earliest entry with a later one would invert that priority.
+        if (min_gen >= generation) {
           continue;
         }
         const int32_t dropped = impl_->pending_experts[victim_idx];
