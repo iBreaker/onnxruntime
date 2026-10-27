@@ -351,16 +351,47 @@ TEST(QMoESharedLayoutTest, Avx2BFloat16AndHalfConversionMatchScalarIncludingNaNs
     }
   }
 
-  shared::FloatToHalfBitsRow(input.data(), scalar_fp16.data(), 10, true);
-  shared::FloatToHalfBitsRow(input.data(), simd_fp16.data(), 10, false);
-  for (size_t i = 0; i < 10; ++i) {
-    EXPECT_EQ(simd_fp16[i], scalar_fp16[i]);
+  // F16C preserves top NaN payload bits whereas the scalar converter canonicalizes NaNs to 0x7E00 (sign preserved).
+  shared::FloatToHalfBitsRow(input.data(), scalar_fp16.data(), input.size(), true);
+  shared::FloatToHalfBitsRow(input.data(), simd_fp16.data(), input.size(), false);
+  for (size_t i = 0; i < input.size(); ++i) {
+    if (std::isnan(input[i])) {
+      EXPECT_TRUE(std::isnan(shared::HalfToFloat(scalar_fp16[i]))) << i;
+      EXPECT_TRUE(std::isnan(shared::HalfToFloat(simd_fp16[i]))) << i;
+    } else {
+      EXPECT_EQ(simd_fp16[i], scalar_fp16[i]) << i;
+    }
   }
-  std::array<float, 10> roundtrip_scalar_fp16{}, roundtrip_simd_fp16{};
-  shared::HalfBitsToFloatRow(scalar_fp16.data(), roundtrip_scalar_fp16.data(), 10, true);
-  shared::HalfBitsToFloatRow(simd_fp16.data(), roundtrip_simd_fp16.data(), 10, false);
-  for (size_t i = 0; i < 10; ++i) {
-    EXPECT_EQ(roundtrip_simd_fp16[i], roundtrip_scalar_fp16[i]);
+  std::array<float, 36> roundtrip_scalar_fp16{}, roundtrip_simd_fp16{};
+  shared::HalfBitsToFloatRow(scalar_fp16.data(), roundtrip_scalar_fp16.data(), scalar_fp16.size(), true);
+  shared::HalfBitsToFloatRow(simd_fp16.data(), roundtrip_simd_fp16.data(), simd_fp16.size(), false);
+  for (size_t i = 0; i < input.size(); ++i) {
+    if (std::isnan(roundtrip_scalar_fp16[i])) {
+      EXPECT_TRUE(std::isnan(roundtrip_simd_fp16[i])) << i;
+    } else {
+      EXPECT_EQ(roundtrip_simd_fp16[i], roundtrip_scalar_fp16[i]) << i;
+    }
+  }
+
+  std::vector<uint16_t> all_half_bits(65536);
+  for (size_t i = 0; i < all_half_bits.size(); ++i) {
+    all_half_bits[i] = static_cast<uint16_t>(i);
+  }
+  std::vector<float> all_scalar_fp16(all_half_bits.size()), all_simd_fp16(all_half_bits.size());
+  shared::HalfBitsToFloatRow(all_half_bits.data(), all_scalar_fp16.data(),
+                             static_cast<int64_t>(all_half_bits.size()), true);
+  shared::HalfBitsToFloatRow(all_half_bits.data(), all_simd_fp16.data(),
+                             static_cast<int64_t>(all_half_bits.size()), false);
+  for (size_t i = 0; i < all_half_bits.size(); ++i) {
+    if (std::isnan(all_scalar_fp16[i])) {
+      EXPECT_TRUE(std::isnan(all_simd_fp16[i])) << i;
+    } else {
+      uint32_t scalar_bits = 0;
+      uint32_t simd_bits = 0;
+      std::memcpy(&scalar_bits, &all_scalar_fp16[i], sizeof(uint32_t));
+      std::memcpy(&simd_bits, &all_simd_fp16[i], sizeof(uint32_t));
+      EXPECT_EQ(simd_bits, scalar_bits) << i;
+    }
   }
 }
 

@@ -1843,7 +1843,6 @@ struct QMoEOffload::PersistentDecodeState {
   volatile uint64_t* doorbell_req_host = nullptr;
   volatile uint64_t* doorbell_done_host = nullptr;
   volatile int32_t* doorbell_tile_rows_host = nullptr;
-  volatile int32_t* cold_count_host = nullptr;
   QMoEOffloadTelemetry* telemetry = nullptr;
   uint64_t cpu_doorbell_wakeups = 0;
   int32_t* pinned_slot_table = nullptr;
@@ -1885,8 +1884,6 @@ struct QMoEOffload::PersistentDecodeState {
     doorbell_req_host = nullptr;
     doorbell_done_host = nullptr;
     doorbell_tile_rows_host = nullptr;
-    cold_count_host = nullptr;
-    telemetry = nullptr;
     pinned_slot_table = nullptr;
   }
 
@@ -2622,44 +2619,46 @@ QMoEOffload::~QMoEOffload() {
     decode_state_->registered_with_doorbell = false;
   }
   if (offload_telemetry_ && decode_state_ && decode_state_->telemetry && !context_failed) {
-    const auto& telemetry = *decode_state_->telemetry;
-    uint64_t substitutions = 0;
-    uint64_t conversions = 0;
-    for (int row = 0; row < 4; ++row) {
-      substitutions += telemetry.substituted_routes_count[row];
-      conversions += telemetry.zero_cold_conversions_count[row];
+    QMoEOffloadTelemetry telemetry{};
+    if (cudaMemcpy(&telemetry, decode_state_->telemetry, sizeof(telemetry), cudaMemcpyDeviceToHost) == cudaSuccess) {
+      uint64_t substitutions = 0;
+      uint64_t conversions = 0;
+      for (int row = 0; row < 4; ++row) {
+        substitutions += telemetry.substituted_routes_count[row];
+        conversions += telemetry.zero_cold_conversions_count[row];
+      }
+      std::fprintf(stderr,
+                   "QMoEOffload telemetry {\"layer\":%" PRId64 ",\"layer_calls\":%" PRIu64
+                   ","
+                   "\"zero_cold_short_circuits\":%" PRIu64 ",\"cpu_doorbell_wakeups\":%" PRIu64
+                   ","
+                   "\"cold_routes\":%" PRIu64 ",\"substituted_routes_count\":%" PRIu64
+                   ","
+                   "\"zero_cold_conversions_count\":%" PRIu64
+                   ",\"last_cold_count\":%d,"
+                   "\"launched_seq\":%" PRIu64 ",\"request_seq\":%" PRIu64 ",\"done_seq\":%" PRIu64
+                   ","
+                   "\"last_serviced_seq\":%" PRIu64 ",\"last_promoted_seq\":%" PRIu64 ",\"last_indices\":[",
+                   static_cast<int64_t>(layer_index_), static_cast<uint64_t>(telemetry.layer_calls),
+                   static_cast<uint64_t>(telemetry.zero_cold_short_circuits),
+                   static_cast<uint64_t>(decode_state_->cpu_doorbell_wakeups),
+                   static_cast<uint64_t>(telemetry.cold_routes),
+                   static_cast<uint64_t>(substitutions), static_cast<uint64_t>(conversions),
+                   telemetry.last_cold_count, static_cast<uint64_t>(decode_state_->launched_seq),
+                   static_cast<uint64_t>(*decode_state_->doorbell_req_host),
+                   static_cast<uint64_t>(*decode_state_->doorbell_done_host),
+                   static_cast<uint64_t>(decode_state_->last_serviced_seq),
+                   static_cast<uint64_t>(decode_state_->last_promoted_seq));
+      for (int route = 0; route < telemetry.last_route_count; ++route) {
+        std::fprintf(stderr, "%s%d", route == 0 ? "" : ",", telemetry.last_indices[route]);
+      }
+      std::fprintf(stderr, "],\"last_weights\":[");
+      for (int route = 0; route < telemetry.last_route_count; ++route) {
+        std::fprintf(stderr, "%s%.9g", route == 0 ? "" : ",", telemetry.last_weights[route]);
+      }
+      std::fprintf(stderr, "]}\n");
+      std::fflush(stderr);
     }
-    std::fprintf(stderr,
-                 "QMoEOffload telemetry {\"layer\":%" PRId64 ",\"layer_calls\":%" PRIu64
-                 ","
-                 "\"zero_cold_short_circuits\":%" PRIu64 ",\"cpu_doorbell_wakeups\":%" PRIu64
-                 ","
-                 "\"cold_routes\":%" PRIu64 ",\"substituted_routes_count\":%" PRIu64
-                 ","
-                 "\"zero_cold_conversions_count\":%" PRIu64
-                 ",\"last_cold_count\":%d,"
-                 "\"launched_seq\":%" PRIu64 ",\"request_seq\":%" PRIu64 ",\"done_seq\":%" PRIu64
-                 ","
-                 "\"last_serviced_seq\":%" PRIu64 ",\"last_promoted_seq\":%" PRIu64 ",\"last_indices\":[",
-                 static_cast<int64_t>(layer_index_), static_cast<uint64_t>(telemetry.layer_calls),
-                 static_cast<uint64_t>(telemetry.zero_cold_short_circuits),
-                 static_cast<uint64_t>(decode_state_->cpu_doorbell_wakeups),
-                 static_cast<uint64_t>(telemetry.cold_routes),
-                 static_cast<uint64_t>(substitutions), static_cast<uint64_t>(conversions),
-                 telemetry.last_cold_count, static_cast<uint64_t>(decode_state_->launched_seq),
-                 static_cast<uint64_t>(*decode_state_->doorbell_req_host),
-                 static_cast<uint64_t>(*decode_state_->doorbell_done_host),
-                 static_cast<uint64_t>(decode_state_->last_serviced_seq),
-                 static_cast<uint64_t>(decode_state_->last_promoted_seq));
-    for (int route = 0; route < telemetry.last_route_count; ++route) {
-      std::fprintf(stderr, "%s%d", route == 0 ? "" : ",", telemetry.last_indices[route]);
-    }
-    std::fprintf(stderr, "],\"last_weights\":[");
-    for (int route = 0; route < telemetry.last_route_count; ++route) {
-      std::fprintf(stderr, "%s%.9g", route == 0 ? "" : ",", telemetry.last_weights[route]);
-    }
-    std::fprintf(stderr, "]}\n");
-    std::fflush(stderr);
   }
   const uint64_t ssd_hits = file_expert_store_.CacheHits();
   const uint64_t ssd_pf_hits = file_expert_store_.PrefetchHits();
@@ -4166,11 +4165,11 @@ void QMoEOffload::InitializeSsdStore() {
 
 Status QMoEOffload::EnsurePersistentDecodeState(OpKernelContext* context, size_t min_gpu_bytes,
                                                 size_t min_host_bytes, cudaStream_t stream) const {
-  const size_t want_gpu = std::max(min_gpu_bytes, size_t{256} << 10) + 512;
+  const size_t telemetry_bytes = offload_telemetry_ ? ((sizeof(QMoEOffloadTelemetry) + 255) & ~size_t{255}) : 0;
+  const size_t want_gpu = std::max(min_gpu_bytes, size_t{256} << 10) + 512 + telemetry_bytes;
   const size_t raw_slot_bytes = static_cast<size_t>(SafeInt<size_t>(num_experts_) * sizeof(int));
   const size_t slot_table_bytes = (raw_slot_bytes + 255) & ~size_t{255};
-  const size_t telemetry_bytes = offload_telemetry_ ? ((sizeof(QMoEOffloadTelemetry) + 255) & ~size_t{255}) : 0;
-  const size_t want_host = std::max(min_host_bytes, size_t{256} << 10) + 512 + slot_table_bytes + telemetry_bytes;
+  const size_t want_host = std::max(min_host_bytes, size_t{256} << 10) + 512 + slot_table_bytes;
   if (!decode_state_) {
     decode_state_ = std::make_unique<PersistentDecodeState>();
   }
@@ -4178,9 +4177,15 @@ Status QMoEOffload::EnsurePersistentDecodeState(OpKernelContext* context, size_t
     decode_state_->scratch = GetScratchBuffer<uint8_t>(want_gpu, GetComputeStream(context));
     ORT_RETURN_IF_NOT(decode_state_->scratch != nullptr, "QMoEOffload failed to allocate persistent decode GPU scratch.");
     decode_state_->scratch_bytes = want_gpu;
-    const size_t seq_off = ((want_gpu - 256) + 255) & ~size_t{255};
+    const size_t seq_off = ((want_gpu - 256 - telemetry_bytes) + 255) & ~size_t{255};
     decode_state_->doorbell_seq_dev = reinterpret_cast<uint64_t*>(decode_state_->scratch.get() + seq_off);
     CUDA_RETURN_IF_ERROR(cudaMemsetAsync(decode_state_->doorbell_seq_dev, 0, sizeof(uint64_t), stream));
+    decode_state_->telemetry =
+        offload_telemetry_ ? reinterpret_cast<QMoEOffloadTelemetry*>(decode_state_->scratch.get() + seq_off + 256)
+                           : nullptr;
+    if (decode_state_->telemetry) {
+      CUDA_RETURN_IF_ERROR(cudaMemsetAsync(decode_state_->telemetry, 0, sizeof(QMoEOffloadTelemetry), stream));
+    }
   }
   if (!decode_state_->pinned || decode_state_->pinned_bytes < want_host) {
     ORT_RETURN_IF(want_host > shared_pinned_limit_,
@@ -4207,14 +4212,12 @@ Status QMoEOffload::EnsurePersistentDecodeState(OpKernelContext* context, size_t
     decode_state_->pinned_accounted_bytes = want_host;
     decode_state_->session_pinned_budget = std::move(sess_pinned);
     std::memset(decode_state_->pinned.get(), 0, want_host);
-    const size_t meta_off = ((want_host - 256 - slot_table_bytes - telemetry_bytes) + 255) & ~size_t{255};
+    const size_t meta_off = ((want_host - 256 - slot_table_bytes) + 255) & ~size_t{255};
     uint8_t* meta_ptr = decode_state_->pinned.get() + meta_off;
     decode_state_->doorbell_req_host = reinterpret_cast<volatile uint64_t*>(meta_ptr + 0);
     decode_state_->doorbell_done_host = reinterpret_cast<volatile uint64_t*>(meta_ptr + 8);
     decode_state_->doorbell_tile_rows_host = reinterpret_cast<volatile int32_t*>(meta_ptr + 16);
-    decode_state_->cold_count_host = reinterpret_cast<volatile int32_t*>(meta_ptr + 20);
-    decode_state_->telemetry = offload_telemetry_ ? reinterpret_cast<QMoEOffloadTelemetry*>(meta_ptr + 256) : nullptr;
-    decode_state_->pinned_slot_table = reinterpret_cast<int32_t*>(meta_ptr + 256 + telemetry_bytes);
+    decode_state_->pinned_slot_table = reinterpret_cast<int32_t*>(meta_ptr + 256);
     decode_state_->last_serviced_seq = 0;
   }
   if (!decode_state_->completed) {
@@ -4255,14 +4258,6 @@ Status QMoEOffload::EnsurePersistentDecodeState(OpKernelContext* context, size_t
 void QMoEOffload::ServiceDoorbell() const {
   if (!decode_state_ || !decode_state_->tile) return;
   ++decode_state_->cpu_doorbell_wakeups;
-  if (v4_policy_.skip_zero_cold_doorbell && resident_promotions_ == 0 &&
-      !DoorbellService::Instance().CrossLayerPromotionEnabled() &&
-      decode_state_->cold_count_host && *decode_state_->cold_count_host == 0) {
-    if (decode_state_->invocation_rec) decode_state_->invocation_rec->MarkCpuDone();
-    std::atomic_thread_fence(std::memory_order_release);
-    *decode_state_->doorbell_done_host = decode_state_->last_serviced_seq;
-    return;
-  }
   const int t_rows = std::max(1, static_cast<int>(*decode_state_->doorbell_tile_rows_host));
   decode_state_->tile->tile_rows = t_rows;
   try {
@@ -7941,7 +7936,9 @@ Status QMoEOffload::ComputeSharedAsync(OpKernelContext* context, const Tensor* i
     CUDA_RETURN_IF_ERROR(cudaGetLastError());
 
     if (v4_planned_mode_ && v4_policy_.tail_substitution_threshold > 0.0f &&
-        tile_rows <= 4 && k_ > 0 && k_ <= 32 && resident_slots_ > 0 && resident_slots_ < num_experts_) {
+        tile_rows <= 4 && k_ > 0 && k_ <= 32 &&
+        v4_policy_.tail_substitution_min_rank < static_cast<int>(k_) &&
+        resident && !all_experts_resident) {
       auto* telemetry = use_persistent_decode ? decode_state_->telemetry : nullptr;
       if (is_bf16_) {
         CUDA_RETURN_IF_ERROR(LaunchQMoETailSubstitution(
@@ -8046,7 +8043,7 @@ Status QMoEOffload::ComputeSharedAsync(OpKernelContext* context, const Tensor* i
           decode_state_->doorbell_tile_rows_host, tile_rows,
           v4_policy_.skip_zero_cold_doorbell && resident_promotions_ == 0 &&
               !DoorbellService::Instance().CrossLayerPromotionEnabled(),
-          decode_state_->doorbell_done_host, decode_state_->cold_count_host, decode_state_->telemetry, scales));
+          decode_state_->doorbell_done_host, decode_state_->telemetry, scales));
       ORT_RETURN_IF_ERROR(enqueue_hits());
       if (bias_gpu_ptr) {
         if (is_bf16_) {

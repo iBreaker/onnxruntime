@@ -101,8 +101,7 @@ cudaError_t LaunchQMoEOffloadClassify(
     uint64_t* doorbell_seq_dev = nullptr, volatile uint64_t* doorbell_req_host = nullptr,
     volatile int32_t* doorbell_tile_rows_host = nullptr, int tile_rows = 0,
     bool skip_zero_cold = false, volatile uint64_t* doorbell_done_host = nullptr,
-    volatile int32_t* cold_count_host = nullptr, QMoEOffloadTelemetry* telemetry = nullptr,
-    const float* topk_scales = nullptr);
+    QMoEOffloadTelemetry* telemetry = nullptr, const float* topk_scales = nullptr);
 
 cudaError_t LaunchQMoETailSubstitution(
     const half* logits, float* topk_scales, int* topk_indices, const int* expert_slot,

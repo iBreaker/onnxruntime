@@ -1723,8 +1723,9 @@ A **single canonical `com.microsoft::QMoE` model package** runs unchanged across
   $E$ experts per layer into GPU HBM during session initialization with zero runtime offload overhead.
 - **VRAM-Constrained GPUs with Ample Host RAM** (e.g., 24 GiB / 32 GiB GPU + 64 GiB–128 GiB RAM):
   caches the hottest $C_l < E$ experts per layer in GPU HBM, executes cold routed experts on the
-  CPU via AVX-512 microkernels overlapped with GPU resident GEMVs inside a single captured CUDA
-  Graph, and promotes newly hot experts asynchronously in the background.
+  CPU via SIMD microkernels (`AVX-512` $\to$ `AVX2+FMA+F16C` $\to$ scalar) overlapped with GPU
+  resident GEMVs inside a single captured CUDA Graph, and promotes newly hot experts asynchronously
+  in the background.
 - **VRAM- and Host-RAM-Constrained Systems** (e.g., 24 GiB / 30 GiB GPU + 48 GB–64 GB RAM): bounds
   host RAM usage via `FileExpertStore` (`session.moe.offload.host_expert_bytes`), maintaining
   disjoint GPU and host residency and streaming uncached cold experts from the backing weight files
@@ -1813,7 +1814,7 @@ session creation with `ORT_INVALID_ARGUMENT`.
 | :--- | :--- | :---: | :--- |
 | `session.moe.offload.mode` | `"disabled"`, `"auto"`, `"required"` | `"disabled"` | `"disabled"`: standard GPU-only QMoE. `"auto"`: places initializers on CPU first; if all experts fit in usable GPU VRAM, uploads all experts to GPU (`C_l = E`), otherwise enables hybrid offload. `"required"`: enforces offload planning under `device_expert_bytes`. |
 | `session.moe.offload.placement` | `"static"`, `"adaptive"` | `"adaptive"` | `"static"`: fixed GPU resident set (`spare_slots = 0`). `"adaptive"`: reserves `spare_slots = 2` per partially offloaded layer and promotes hot cold experts into GPU HBM between steps. |
-| `session.moe.offload.cpu_execution` | `"auto"`, `"enabled"`, `"disabled"` | `"auto"` | Controls AVX-512 CPU cold-expert execution during decode (`rows <= async_max_tokens`). |
+| `session.moe.offload.cpu_execution` | `"auto"`, `"enabled"`, `"disabled"` | `"auto"` | Controls CPU cold-expert execution (`AVX-512` $\to$ `AVX2+FMA+F16C` $\to$ scalar) during decode (`rows <= async_max_tokens`). `"disabled"` forces the GPU streaming DMA path even for decode. |
 | `session.moe.offload.device_expert_bytes` | `"auto"` or integer bytes | `"auto"` | Maximum GPU HBM bytes for all MoE resident + spare expert slabs and lookup tables in the session. `"auto"` uses `usable_free_vram - reserve_device_bytes - device_working_bytes`. |
 | `session.moe.offload.host_expert_bytes` | `"auto"` or integer bytes | `"auto"` | Maximum host RAM bytes for cold experts. `"auto"` uses direct `MAP_SHARED` `mmap` over the external weight files. A finite value smaller than total expert bytes enables the bounded `FileExpertStore` LRU host cache and evicts `mmap` source pages via `madvise(MADV_DONTNEED)`. |
 | `session.moe.offload.reserve_device_bytes` | `"auto"` or integer bytes | `0` | GPU VRAM bytes reserved for post-initialization KV/GDN caches, child sessions (`mtp.onnx`), and CUDA Graph pools when `device_expert_bytes="auto"`. |
@@ -1825,8 +1826,8 @@ session creation with `ORT_INVALID_ARGUMENT`.
 | `session.moe.offload.cpu_threads` | Non-negative integer | `0` (`auto`) | Number of `SpinPool` worker threads for cold-expert CPU execution (`0` auto-detects physical cores via `DiscoverPhysicalCoreCount()`). |
 | `session.moe.offload.async_max_tokens` | Non-negative integer | `4` | Token threshold separating hybrid doorbell decode (`rows <= async_max_tokens`) from GPU streaming DMA prefill (`rows > async_max_tokens`). |
 | `session.moe.offload.prefill_wave_experts` | Positive integer | `32` | Maximum experts per compaction/DMA wave during prefill (further bounded by `device_working_bytes`). |
-| `session.moe.offload.skip_zero_cold_doorbell` | `"0"`, `"1"` | `"0"` | Complete zero-cold partial-residency decode calls on the GPU without dispatching CPU expert work (`ORT_QMOE_SKIP_ZERO_COLD_DOORBELL` fallback). Applies to static placement with cross-layer promotions disabled. |
-| `session.moe.offload.tail_substitution_threshold` | Finite non-negative float | `0.0` | Opt-in approximate routing for 1..4 decode rows (`ORT_QMOE_TAIL_SUBSTITUTION_THRESHOLD` fallback): replace cold tail experts (`rank >= min_rank`) with unselected GPU-resident experts when the probability/scale gap is within this threshold, preserving untouched dominant weights (`0..min_rank-1`) and renormalizing across the substituted tail mass. Zero disables substitution. |
+| `session.moe.offload.skip_zero_cold_doorbell` | `"0"`, `"1"` | `"0"` | Complete zero-cold partial-residency decode calls on the GPU without staging activations/indices to pinned host memory or dispatching CPU expert work (`ORT_QMOE_SKIP_ZERO_COLD_DOORBELL=1` environment fallback when the session option is unset). Applies to static placement (`resident_promotions == 0`) with cross-layer promotions disabled. Setting `ORT_QMOE_OFFLOAD_TELEMETRY=1` prints per-layer JSON counters (`layer_calls`, `zero_cold_short_circuits`, `cpu_doorbell_wakeups`, `cold_routes`) to `stderr` at session destruction. |
+| `session.moe.offload.tail_substitution_threshold` | Finite non-negative float | `0.0` | Opt-in approximate routing for 1..4 decode rows (`ORT_QMOE_TAIL_SUBSTITUTION_THRESHOLD` fallback): replace cold tail experts (`rank >= min_rank`) with the highest-probability unselected GPU-resident experts when `effective_gap <= threshold` (`sqrt(prob_gap * max(0, scale_gap))` when `normalize_routing_weights=1` and `min_rank > 0`, otherwise `prob_gap`) and `scale_within_bound` (`scale_gap <= threshold` or `orig_scale <= max(25 * threshold, 0.05)` when `normalize_routing_weights=1` and `min_rank > 0`), preserving untouched dominant weights (`0..min_rank-1`) and renormalizing across the substituted tail mass (`row_scales[rank]`). Zero disables substitution. |
 | `session.moe.offload.tail_substitution_min_rank` | Integer `0 <= min_rank < k` when enabled | `6` | First eligible zero-based top-$k$ rank for tail substitution (`ORT_QMOE_TAIL_SUBSTITUTION_MIN_RANK` fallback). |
 | `session.moe.offload.popularity_file` | Relative or absolute path | `""` | Optional path to `expert-profile.bin` (`STRP` v1 format). Relative paths resolve against the model directory. |
 | `session.moe.offload.source_root` | Relative or absolute path | Model directory | Root directory used to resolve external weight files and relative profile paths. |
@@ -1990,7 +1991,7 @@ full-model CUDA Graph:
      activations (`<= 20 KiB`) directly into UVA-mapped pinned host memory (`host_indices`, `host_input`),
      executes `__threadfence_system()`, increments the device sequence counter `*doorbell_seq_dev`,
      and writes `*doorbell_req_host = next_seq` to wake the persistent `DoorbellService` host thread.
-2. **Concurrent GPU Resident GEMV & CPU Cold-Expert AVX-512 Execution**:
+2. **Concurrent GPU Resident GEMV & CPU Cold-Expert SIMD Execution**:
    - **On the GPU (`stream`)**: `MoeGemvFp4DecodeKernel` executes FC1 (SwiGLU) and FC2 immediately on
      the GPU resident slab (`[C_l + S_l, ...]`). Because `MoeGemvFp4DecodeKernel` natively skips
      negative slot indices (`slot < 0`), **zero dummy slots (`dummy_slots = 0`)** are allocated or read.
@@ -1999,13 +2000,19 @@ full-model CUDA Graph:
    - **On the CPU (`DoorbellService` + `SpinPool`)**: `DoorbellService` detects `*doorbell_req_host == next_seq`
      and dispatches the missed experts across `SpinPool` workers pinned to distinct physical cores
      alternating across NUMA sockets / L3 CCDs (`DiscoverPhysicalCoreCount()`).
-   - **AVX-512 Cold-Expert Microkernels (`Fp4Group4Avx512<RT=1..4>`)**: Cold NVFP4 experts are
-     evaluated directly from their row-major `[N, K/2]` storage without weight conversion using
-     `_mm512_permutex2var_ps` 2D LUT permutes (`stack_fma = 0`, `stack_mov = 0`), multi-row contiguous
-     activation reuse (`RT = 1..4` tokens routed to the same cold expert share a single DDR5 weight
-     read), and a single fused `ParallelFor(total_fc1 + total_fc2)` coordinated by per-expert atomic
-     readiness counters (`fc1_done[slot]`) so each expert's FC2 tasks start immediately after its own
-     FC1 tasks finish. Results are written directly into UVA-mapped pinned `host_result`.
+   - **Cold-Expert SIMD Microkernels (`Fp4Group4Avx512<RT=1..4>`, `Int4Group8Avx512`, `Int4Group8Avx2<RT=1..4>`, `Int3Group4Avx512`)**:
+     Cold experts dispatch at runtime in order `AVX-512` $\to$ `AVX2+FMA+F16C` $\to$ scalar (`CpuHasAvx512()`,
+     `CpuHasAvx2FmaF16c()`). Cold NVFP4 experts use `Fp4Group4Avx512<RT=1..4>` directly from row-major
+     `[N, K/2]` storage using `_mm512_permutex2var_ps` 2D LUT permutes (`stack_fma = 0`, `stack_mov = 0`).
+     Cold INT4 experts (`block_size = 32`, both SM80 prepacked `ColumnMajorTileInterleave<64,4>` and raw
+     row-major `[N, K/2]`, with FP16 or BF16 scales/biases and row conversions) execute via `Avx512Int4GemmRange`
+     on AVX-512 hosts or `Avx2Int4GemmRange` (`Int4Group8Avx2` / `Int4Group4Avx2`) on AVX2+FMA+F16C hosts
+     (e.g., AMD EPYC Zen 2); setting `ORT_QMOE_CPU_DISABLE_AVX512=1` at process start forces AVX-512 hosts
+     onto the AVX2+FMA+F16C path for testing. Multi-row contiguous activation reuse (`RT = 1..4` tokens
+     routed to the same cold expert share a single DDR weight read) and a single fused
+     `ParallelFor(total_fc1 + total_fc2)` coordinated by per-expert atomic readiness counters (`fc1_done[slot]`)
+     allow each expert's FC2 tasks to start immediately after its own FC1 tasks finish. Results are written
+     directly into UVA-mapped pinned `host_result`.
 3. **Fused Wait, Merge, Finalize & Combine (`QMoEOffloadMergeFinalizeCombineKernel`)**:
    - Preloads GPU-resident `wave_output` hits and `shared_out` into registers while thread 0 spins on
      `*doorbell_done_host >= *doorbell_seq_dev`, then reads CPU cold outputs zero-copy from mapped
@@ -2070,7 +2077,7 @@ Implementation files:
 - [moe_offload_plan.h](onnxruntime/core/framework/moe_offload_plan.h) — `MoeOffloadSessionPolicy`, `MoeExpertSourceDescriptor`, `MoeBackendCapabilities`, `MoeNodeExecutionPlan`, and `IMoeOffloadNode`;
 - [session_state.cc](onnxruntime/core/framework/session_state.cc) — Stage 1 `PlaceMoeOffloadInitializersOnCpu` and Stage 3 `OnSessionInitializationEnd` hook;
 - [qmoe_session_controller.h](onnxruntime/core/providers/cuda/qmoe_session_controller.h) — `PlanAndAdmitSession`, `QueryPlatformUsableDeviceMemory`, `PrepareLinuxHostExpertMappings`, and `EvictUploadedHostPages`;
-- [qmoe_shared_layout.h](onnxruntime/contrib_ops/cpu/moe/qmoe_shared_layout.h), [qmoe_shared_layout.cc](onnxruntime/contrib_ops/cpu/moe/qmoe_shared_layout.cc), [qmoe_shared_layout_avx512.cc](onnxruntime/contrib_ops/cpu/moe/qmoe_shared_layout_avx512.cc) — 4-bit expert layouts, AVX-512 microkernels (`Fp4Group4Avx512`), and `FileExpertStore`;
+- [qmoe_shared_layout.h](onnxruntime/contrib_ops/cpu/moe/qmoe_shared_layout.h), [qmoe_shared_layout.cc](onnxruntime/contrib_ops/cpu/moe/qmoe_shared_layout.cc), [qmoe_shared_layout_avx512.cc](onnxruntime/contrib_ops/cpu/moe/qmoe_shared_layout_avx512.cc) — expert layouts, AVX-512 (`Fp4Group4Avx512`, `Int4Group8Avx512`, `Int3Group4Avx512`) and AVX2+FMA+F16C (`Int4Group8Avx2`) microkernels, and `FileExpertStore`;
 - [qmoe_spin_pool.h](onnxruntime/contrib_ops/cuda/moe/qmoe_spin_pool.h) — NUMA/CCD-pinned `SpinPool` (`DiscoverPhysicalCoreCount`) and `CpuBudgetGroup`;
 - [moe_quantization.cc](onnxruntime/contrib_ops/cuda/moe/moe_quantization.cc), [qmoe_offload.cc](onnxruntime/contrib_ops/cuda/moe/qmoe_offload.cc), [qmoe_kernels.cu](onnxruntime/contrib_ops/cuda/moe/qmoe_kernels.cu) — `QMoE` `IMoeOffloadNode` integration, doorbell CUDA-graph decode, adaptive promotion, and hybrid UVA + compact DMA prefill.
 
@@ -2087,7 +2094,7 @@ Implementation files:
 | [test_qmoe_fp4_cuda.py](onnxruntime/test/python/transformers/test_qmoe_fp4_cuda.py) | MXFP4 QMoE: quantization utilities, packing, FP16/BF16, SiLU/SwiGLU, top-k and expert-count variants. On SM80+ (including SM120) `TestQMoEFP4Sm80SingleWeightCopy` checks the SM80 grouped GEMM + fused GEMV regime against the dequant fallback. |
 | [test_qmoe_fp8_cuda.py](onnxruntime/test/python/transformers/test_qmoe_fp8_cuda.py) | Legacy FP8 W8A16 native/dequant paths and square-block FP8 fallback, separate FC3, fused SwiGLU, partial blocks, top-10, validation errors, and opt-in official Qwen dimensions. |
 | [test_qmoe_wfp4afp8_cuda.py](onnxruntime/test/python/transformers/test_qmoe_wfp4afp8_cuda.py) | WFP4AFP8 — native Blackwell path requires SM100+; SM<100 exercises the dequant fallback. |
-| [test_qmoe_shared_layout.py](onnxruntime/test/python/transformers/test_qmoe_shared_layout.py) | Shared 4-bit expert block layouts (`INT4`, `MXFP4`, `NVFP4`), scalar vs. AVX-512 cold-expert kernel parity, and `FileExpertStore` roundtrips. |
+| [test_qmoe_shared_layout.py](onnxruntime/test/python/transformers/test_qmoe_shared_layout.py) | Shared expert block layouts (`INT4`, `INT3`, `MXFP4`, `NVFP4`), scalar vs. AVX-512 and AVX2+FMA+F16C cold-expert kernel parity, and `FileExpertStore` roundtrips. |
 | [test_qmoe_offload_v4.py](onnxruntime/test/python/test_qmoe_offload_v4.py) | Portable QMoE Offload v4 (`session.moe.offload.*` on canonical `com.microsoft::QMoE`): rejection of invalid/legacy config keys, numerical parity across `disabled`, `auto`, `static`, `adaptive`, and `bounded_host` (`FileExpertStore`) modes for decode (`T=1,2,4`) and prefill (`T=16`), and full CUDA Graph capture and replay. |
 
 ### Reference computation

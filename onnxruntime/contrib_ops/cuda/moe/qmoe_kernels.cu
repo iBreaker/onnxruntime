@@ -155,7 +155,7 @@ __global__ void QMoEOffloadClassifyKernel(
     uint64_t* doorbell_seq_dev, volatile uint64_t* doorbell_req_host,
     volatile int32_t* doorbell_tile_rows_host, int tile_rows,
     bool skip_zero_cold, volatile uint64_t* doorbell_done_host,
-    volatile int32_t* cold_count_host, QMoEOffloadTelemetry* telemetry, const float* topk_scales) {
+    QMoEOffloadTelemetry* telemetry, const float* topk_scales) {
   const int row = blockIdx.x * blockDim.x + threadIdx.x;
   int exp = 0;
   int slot = -1;
@@ -171,7 +171,7 @@ __global__ void QMoEOffloadClassifyKernel(
       hit_flag[row] = slot >= 0;
       if (telemetry != nullptr && row < 256) {
         telemetry->last_indices[row] = exp;
-        telemetry->last_weights[row] = topk_scales[row];
+        telemetry->last_weights[row] = (topk_scales != nullptr) ? topk_scales[row] : 0.0f;
       }
     }
   }
@@ -208,9 +208,6 @@ __global__ void QMoEOffloadClassifyKernel(
     } else {
       __syncthreads();
       if (threadIdx.x == 0) {
-        if (cold_count_host != nullptr) {
-          *cold_count_host = cold_count;
-        }
         if (doorbell_tile_rows_host != nullptr) {
           *doorbell_tile_rows_host = tile_rows;
         }
@@ -299,7 +296,7 @@ cudaError_t LaunchQMoEOffloadClassify(
     uint64_t* doorbell_seq_dev, volatile uint64_t* doorbell_req_host,
     volatile int32_t* doorbell_tile_rows_host, int tile_rows,
     bool skip_zero_cold, volatile uint64_t* doorbell_done_host,
-    volatile int32_t* cold_count_host, QMoEOffloadTelemetry* telemetry, const float* topk_scales) {
+    QMoEOffloadTelemetry* telemetry, const float* topk_scales) {
   if (row_count <= 0) return cudaSuccess;
   if (doorbell_seq_dev != nullptr && doorbell_req_host != nullptr && row_count <= 256) {
     QMoEOffloadClassifyKernel<<<1, 256, 0, stream>>>(
@@ -308,7 +305,7 @@ cudaError_t LaunchQMoEOffloadClassify(
         host_indices_out, reinterpret_cast<const uint4*>(input_dev),
         reinterpret_cast<uint4*>(host_input_out), input_vec4_count,
         doorbell_seq_dev, doorbell_req_host, doorbell_tile_rows_host, tile_rows,
-        skip_zero_cold, doorbell_done_host, cold_count_host, telemetry, topk_scales);
+        skip_zero_cold, doorbell_done_host, telemetry, topk_scales);
     return cudaGetLastError();
   }
   const int blocks = row_count / 128 + (row_count % 128 != 0);
@@ -317,7 +314,7 @@ cudaError_t LaunchQMoEOffloadClassify(
       unit_scales, identity_permutation, k_for_source_rows,
       host_indices_out, reinterpret_cast<const uint4*>(input_dev),
       reinterpret_cast<uint4*>(host_input_out), input_vec4_count,
-      nullptr, nullptr, nullptr, tile_rows, false, nullptr, nullptr, nullptr, nullptr);
+      nullptr, nullptr, nullptr, tile_rows, false, nullptr, nullptr, nullptr);
   return cudaGetLastError();
 }
 
@@ -418,7 +415,8 @@ __global__ void QMoETailSubstitutionKernel(
             ? sqrtf(prob_gap * fmaxf(0.0f, scale_gap))
             : prob_gap;
     const bool scale_within_bound =
-        !normalize_scales || min_rank == 0 || orig_scale <= fmaxf(threshold * 25.0f, 0.050f);
+        !normalize_scales || min_rank == 0 || scale_gap <= threshold ||
+        orig_scale <= fmaxf(threshold * 25.0f, 0.050f);
     if (best_expert < num_experts && effective_gap <= threshold && scale_within_bound) {
       if (lane == 0) {
         row_indices[rank] = best_expert;
@@ -426,7 +424,7 @@ __global__ void QMoETailSubstitutionKernel(
         selected[best_expert / 32] |= uint32_t{1} << (best_expert % 32);
       }
       sub_rank_mask |= (uint32_t{1} << rank);
-      sub_orig_scale_mass += orig_scale;
+      sub_orig_scale_mass += row_scales[rank];
       ++substitutions;
       __syncwarp();
     }
