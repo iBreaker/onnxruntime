@@ -3,6 +3,7 @@
 
 #include "contrib_ops/cuda/math/swiglu_impl.h"
 
+#include "contrib_ops/cuda/math/swiglu_activation.cuh"
 #include "core/providers/cuda/cu_inc/common.cuh"
 
 using namespace onnxruntime::cuda;
@@ -28,25 +29,9 @@ __global__ void SwiGLUKernel(int64_t count, int64_t cols, float limit, float alp
   for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < count;
        i += stride) {
     const int64_t src = Fused ? i + (i / cols) * cols : i;
-    float g = static_cast<float>(gate[src]);
-    float l = static_cast<float>(up[src]);
-    if (limit > 0.0f) {
-      g = fminf(g, limit);
-      l = fminf(fmaxf(l, -limit), limit);
-    }
-    const float scaled = alpha * g;
-    float result;
-    if (scaled < -87.0f) {
-      // Float exp enters its subnormal range near -87 and underflows to zero by -104, which would
-      // zero a tail that the following multiply by (l + beta) can bring back into range. Keep the
-      // whole product wide, as QuickGelu does.
-      const double wide_g = static_cast<double>(g);
-      const double e = exp(wide_g * static_cast<double>(alpha));
-      result = static_cast<float>(wide_g * e / (1.0 + e) * (static_cast<double>(l) + static_cast<double>(beta)));
-    } else {
-      result = g * _Sigmoid(scaled) * (l + beta);
-    }
-    output[i] = static_cast<CudaT>(result);
+    const float g = static_cast<float>(gate[src]);
+    const float l = static_cast<float>(up[src]);
+    output[i] = static_cast<CudaT>(SwiGluActivation(g, l, limit, alpha, beta));
   }
 }
 
