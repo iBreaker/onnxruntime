@@ -654,11 +654,18 @@ Status QMoECPU<T>::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr all
     // canonical (rows, cols) are unambiguous even when weights use legacy [E, K, N/2] tensor shapes.
     // Otherwise defer unpacking to ComputeCommon, where CheckInputs resolves dimensions and only routed
     // experts are unpacked.
+    // PrePack runs in input order and SessionState releases a single-use initializer once its PrePack reports
+    // is_packed, so FC1's weights are already gone when FC2 is pre-packed. A packed FC1 passed this gate, so
+    // FC2 must be canonicalized too: a canonical FC1 paired with legacy-shaped FC2 weights fails CheckInputs.
+    const bool fc1_already_packed =
+        (packed_fc1_ != nullptr) || (packed_fc1_lut_cache_ != nullptr) || (qnbit_fc1_.packed != nullptr);
     const Tensor* fc1_weights_init = nullptr;
     const Tensor* fc2_weights_init = nullptr;
     const Tensor* fc1_scales_init = nullptr;
     const Tensor* fc2_scales_init = nullptr;
-    if (!Info().TryGetConstantInput(2, &fc1_weights_init) || fc1_weights_init == nullptr ||
+    const bool fc1_weights_available =
+        fc1_already_packed || (Info().TryGetConstantInput(2, &fc1_weights_init) && fc1_weights_init != nullptr);
+    if (!fc1_weights_available ||
         !Info().TryGetConstantInput(5, &fc2_weights_init) || fc2_weights_init == nullptr ||
         !Info().TryGetConstantInput(3, &fc1_scales_init) || fc1_scales_init == nullptr ||
         fc1_scales_init->Shape().NumDimensions() != 3 || fc1_scales_init->Shape()[0] != num_experts ||

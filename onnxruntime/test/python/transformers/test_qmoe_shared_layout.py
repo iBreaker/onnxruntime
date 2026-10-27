@@ -139,6 +139,32 @@ def run_cpu(lib, block, hidden, inter, x, force_scalar, swiglu=(1.0, 0.0, float(
     return out
 
 
+def require_weights_prepacked_support(test, ort, invalid_model):
+    """Skips unless the loaded onnxruntime rejects `invalid_model`, which sets an invalid weights_prepacked value."""
+    try:
+        ort.InferenceSession(invalid_model, providers=["CPUExecutionProvider"])
+    except Exception:
+        return
+    test.skipTest(
+        "Loaded onnxruntime package predates CPU QMoE weights_prepacked support; "
+        "set PYTHONPATH to the current build directory."
+    )
+
+
+def reference_moe_forward(lib, blocks, hidden, inter, x, router, top_k):
+    """Top-k routed float64 mixture of shared-block expert forwards, independent of the ORT QMoE operator."""
+    want = np.zeros((x.shape[0], hidden), dtype=np.float64)
+    for t in range(x.shape[0]):
+        top = np.argsort(-router[t].astype(np.float32), kind="stable")[:top_k]
+        logits = router[t][top].astype(np.float64)
+        w = np.exp(logits - logits.max())
+        w /= w.sum()
+        for wi, e in zip(w, top, strict=False):
+            y = run_cpu(lib, blocks[e], hidden, inter, x[t : t + 1].astype(np.float32), False)
+            want[t] += wi * y[0]
+    return want
+
+
 @unittest.skipIf(sys.platform == "win32", "SharedLayoutTest requires POSIX g++ toolchain to build shared test library.")
 class SharedLayoutTest(unittest.TestCase):
     def test_fp16_boundaries_match_explicit_reference(self):
@@ -455,15 +481,7 @@ class SharedLayoutTest(unittest.TestCase):
         router = rng.standard_normal((tokens, num_experts)).astype(np.float16)
 
         m_invalid = build_qmoe_model(*args, raw1, common[0], common[1], raw2, stack("fc2_scales"), stack("fc2_bias"), 2)
-        try:
-            ort.InferenceSession(m_invalid, providers=["CPUExecutionProvider"])
-        except Exception:
-            pass
-        else:
-            self.skipTest(
-                "Loaded onnxruntime package predates CPU QMoE weights_prepacked support; "
-                "set PYTHONPATH to the current build directory."
-            )
+        require_weights_prepacked_support(self, ort, m_invalid)
 
         for disable_prepack in ("0", "1"):
             so = ort.SessionOptions()
@@ -538,16 +556,85 @@ class SharedLayoutTest(unittest.TestCase):
 
         lib = load_lib()
         blocks = [ref.assemble_block(hidden, inter, **e) for e in experts]
-        want = np.zeros((tokens, hidden), dtype=np.float64)
-        for t in range(tokens):
-            top = np.argsort(-router[t].astype(np.float32), kind="stable")[:top_k]
-            logits = router[t][top].astype(np.float64)
-            w = np.exp(logits - logits.max())
-            w /= w.sum()
-            for wi, e in zip(w, top, strict=False):
-                y = run_cpu(lib, blocks[e], hidden, inter, x[t : t + 1].astype(np.float32), False)
-                want[t] += wi * y[0]
+        want = reference_moe_forward(lib, blocks, hidden, inter, x, router, top_k)
         np.testing.assert_allclose(y_pk.astype(np.float64), want, rtol=1e-2, atol=5e-3)
+
+    def test_cpu_qmoe_prepacked_legacy_shapes_with_constant_scales(self):
+        # SessionState releases a single-use initializer as soon as its PrePack reports is_packed, so FC1's
+        # initializer is already gone when FC2 is pre-packed. Both weights must still be canonicalized together.
+        # When hidden is neither inter nor 2 * inter, the legacy shapes ([E, hidden, inter] and
+        # [E, inter, hidden / 2]) differ from the canonical ones, so a canonical FC1 paired with a legacy FC2
+        # is rejected by CheckInputs.
+        try:
+            import onnxruntime as ort  # noqa: PLC0415
+        except ImportError:
+            ort = None
+        if ort is None:
+            self.skipTest("onnxruntime python package is not available on PYTHONPATH")
+
+        rng = np.random.default_rng(20261027)
+        lib = load_lib()
+        for hidden, inter in ((256, 64), (64, 128)):
+            self._check_prepacked_constant_scales(ort, lib, rng, hidden, inter)
+
+    def _check_prepacked_constant_scales(self, ort, lib, rng, hidden, inter, tokens=4, num_experts=4, top_k=2):
+        experts = [random_expert(rng, hidden, inter) for _ in range(num_experts)]
+        stacked = {
+            key: np.stack([e[key] for e in experts]) for key in ("fc1_scales", "fc1_bias", "fc2_scales", "fc2_bias")
+        }
+        sm80_fc1 = [ref.pack_sm80_w4(e["fc1_codes"]) for e in experts]
+        sm80_fc2 = [ref.pack_sm80_w4(e["fc2_codes"]) for e in experts]
+
+        def build(fc1_weights, fc2_weights, prepacked, **shapes):
+            return build_qmoe_model(
+                num_experts,
+                hidden,
+                inter,
+                top_k,
+                fc1_weights,
+                stacked["fc1_scales"],
+                stacked["fc1_bias"],
+                fc2_weights,
+                stacked["fc2_scales"],
+                stacked["fc2_bias"],
+                prepacked,
+                **shapes,
+            )
+
+        raw_fc1 = np.stack([ref.raw_pack(e["fc1_codes"]) for e in experts])
+        raw_fc2 = np.stack([ref.raw_pack(e["fc2_codes"]) for e in experts])
+        require_weights_prepacked_support(self, ort, build(raw_fc1, raw_fc2, 2))
+        models = {
+            "raw": build(raw_fc1, raw_fc2, False),
+            "canonical": build(
+                np.stack([w.reshape(2 * inter, hidden // 2) for w in sm80_fc1]),
+                np.stack([w.reshape(hidden, inter // 2) for w in sm80_fc2]),
+                True,
+            ),
+            "legacy": build(
+                np.stack([w.reshape(hidden, inter) for w in sm80_fc1]),
+                np.stack([w.reshape(inter, hidden // 2) for w in sm80_fc2]),
+                True,
+                w1_shape=(num_experts, hidden, inter),
+                w2_shape=(num_experts, inter, hidden // 2),
+            ),
+        }
+
+        x = (rng.standard_normal((tokens, hidden)) * 0.5).astype(np.float16)
+        router = rng.standard_normal((tokens, num_experts)).astype(np.float16)
+        blocks = [ref.assemble_block(hidden, inter, **e) for e in experts]
+        want = reference_moe_forward(lib, blocks, hidden, inter, x, router, top_k)
+        for disable_prepack in ("0", "1"):
+            with self.subTest(hidden=hidden, inter=inter, disable_prepacking=disable_prepack):
+                so = ort.SessionOptions()
+                so.add_session_config_entry("session.disable_prepacking", disable_prepack)
+                outputs = {}
+                for name, model in models.items():
+                    sess = ort.InferenceSession(model, sess_options=so, providers=["CPUExecutionProvider"])
+                    outputs[name] = sess.run(None, {"x": x, "router": router})[0]
+                np.testing.assert_array_equal(outputs["raw"], outputs["canonical"])
+                np.testing.assert_array_equal(outputs["raw"], outputs["legacy"])
+                np.testing.assert_allclose(outputs["legacy"].astype(np.float64), want, rtol=1e-2, atol=5e-3)
 
 
 def build_qmoe_model(
