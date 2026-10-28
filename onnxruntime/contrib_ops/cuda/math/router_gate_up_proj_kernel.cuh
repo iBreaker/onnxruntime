@@ -59,7 +59,8 @@ struct Params {
   float beta;
 };
 
-// Shapes the kernel handles; everything else must use the generic path.
+// Shapes the kernel handles; everything else must use the generic path. The kernel also needs `w` aligned to 16 bytes
+// and `x` to 4 bytes (vector loads), which the caller checks.
 inline bool Supports(int rows, int k, int router, int inter) {
   return rows >= 1 && rows <= kMaxRows && k > 0 && k % (kKSplit * kKPerIter) == 0 &&
          k / kKSplit / kKPerIter <= kMaxIters && router > 0 && router % kRouterUnit == 0 && inter > 0 &&
@@ -102,7 +103,8 @@ __device__ __forceinline__ void Mma16816(float (&d)[4], const uint32_t (&a)[4], 
 }
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
-// Clusters and programmatic dependent launch need sm_90; the host never launches this kernel on older devices.
+// Clusters and programmatic dependent launch need sm_90. Device code generated from older PTX, including a JIT for a
+// newer device, lands here, so the host launches this kernel only after checking the loaded image was built for sm_90+.
 template <int NI, bool kBf16>
 __global__ void RouterGateUpProjKernel(Params) {}
 #else

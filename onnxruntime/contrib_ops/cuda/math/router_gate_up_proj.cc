@@ -60,7 +60,7 @@ Status RouterGateUpProj<T>::ComputeInternal(OpKernelContext* context) const {
   const int64_t k = x_shape[last_axis];
   const int64_t n = w_shape[1];
   const int64_t rest = n - router_size_;
-  ORT_RETURN_IF_NOT(k > 0 && w_shape[0] == k, "W's first dimension must match X's last dimension");
+  ORT_RETURN_IF_NOT(w_shape[0] == k, "W's first dimension must match X's last dimension");
   ORT_RETURN_IF_NOT(rest > 0 && rest % 2 == 0,
                     "W's second dimension must be router_size plus an even positive number");
   const int64_t inter = rest / 2;
@@ -75,7 +75,8 @@ Status RouterGateUpProj<T>::ComputeInternal(OpKernelContext* context) const {
   if (rows == 0) return Status::OK();
 
   constexpr bool is_bf16 = std::is_same_v<T, BFloat16>;
-  if (RouterGateUpProjUsesFusedKernel(GetDeviceProp().major, rows, k, router_size_, inter)) {
+  if (RouterGateUpProjUsesFusedKernel(GetDeviceProp().major, rows, k, router_size_, inter, x->DataRaw(),
+                                      w->DataRaw())) {
     // Programmatic dependent launch is opt-in: with it the early-resident CTAs slow the producer kernel down more
     // than the overlapped weight prefetch gains (about +0.1 ms per decode cycle on H200).
     static const bool pdl_enabled =

@@ -3,7 +3,10 @@
 
 #include "contrib_ops/cuda/math/router_gate_up_proj_impl.h"
 
+#include <cstdint>
 #include <limits>
+#include <mutex>
+#include <unordered_map>
 
 #include "contrib_ops/cuda/math/router_gate_up_proj_kernel.cuh"
 
@@ -52,14 +55,44 @@ void LaunchSplitActivation(cudaStream_t stream, int64_t rows, int64_t n, int64_t
       static_cast<const V*>(y), static_cast<V*>(router_out), static_cast<V*>(act_out));
 }
 
+// Whether the image of the fused kernel that the runtime loads for the current device was compiled for sm_90+. All
+// instantiations share one module, so probing one is enough. A device-side ptxVersion below 90 means the kernel body
+// is the empty stub, whether the image is SASS for an older device or a PTX JIT of an older virtual architecture
+// (for example a build with CMAKE_CUDA_ARCHITECTURES=80 running on an H100).
+bool FusedKernelImageIsSm90() {
+  int device = 0;
+  if (cudaGetDevice(&device) != cudaSuccess) {
+    (void)cudaGetLastError();
+    return false;
+  }
+  static std::mutex mutex;
+  static std::unordered_map<int, bool> cache;
+  std::lock_guard<std::mutex> lock(mutex);
+  auto it = cache.find(device);
+  if (it == cache.end()) {
+    cudaFuncAttributes attributes{};
+    const bool ok = cudaFuncGetAttributes(&attributes, router_gate_up::RouterGateUpProjKernel<1, true>) ==
+                        cudaSuccess &&
+                    attributes.ptxVersion >= 90;
+    // Clear any error from probing so it is not reported by an unrelated later call.
+    (void)cudaGetLastError();
+    it = cache.emplace(device, ok).first;
+  }
+  return it->second;
+}
+
 }  // namespace
 
-bool RouterGateUpProjUsesFusedKernel(int sm_major, int64_t rows, int64_t k, int64_t router, int64_t inter) {
+bool RouterGateUpProjUsesFusedKernel(int sm_major, int64_t rows, int64_t k, int64_t router, int64_t inter,
+                                     const void* x, const void* w) {
   constexpr int64_t kMaxDim = std::numeric_limits<int>::max() / 2;
+  // The kernel loads W as uint4 and X as uint32_t; every offset it adds is a multiple of that width.
+  const bool aligned = (reinterpret_cast<uintptr_t>(x) % 4 == 0) && (reinterpret_cast<uintptr_t>(w) % 16 == 0);
   return sm_major >= 9 && rows >= 1 && rows <= router_gate_up::kMaxRows && k <= kMaxDim && router <= kMaxDim &&
          inter <= kMaxDim &&
          router_gate_up::Supports(static_cast<int>(rows), static_cast<int>(k), static_cast<int>(router),
-                                  static_cast<int>(inter));
+                                  static_cast<int>(inter)) &&
+         aligned && FusedKernelImageIsSm90();
 }
 
 Status LaunchRouterGateUpProjFused(cudaStream_t stream, bool use_pdl, bool is_bf16, const void* x, const void* w,
@@ -89,13 +122,20 @@ Status LaunchRouterGateUpProjGeneric(cublasHandle_t cublas, cudaStream_t stream,
   ORT_RETURN_IF_NOT(rows <= std::numeric_limits<int>::max() && n <= std::numeric_limits<int>::max() &&
                         k <= std::numeric_limits<int>::max(),
                     "RouterGateUpProj dimension is too large");
-  const float one = 1.0f;
-  const float zero = 0.0f;
-  const cudaDataType_t type = is_bf16 ? CUDA_R_16BF : CUDA_R_16F;
-  CUBLAS_RETURN_IF_ERROR(cublasGemmEx(cublas, CUBLAS_OP_N, CUBLAS_OP_N, static_cast<int>(n), static_cast<int>(rows),
-                                      static_cast<int>(k), &one, w, type, static_cast<int>(n), x, type,
-                                      static_cast<int>(k), &zero, scratch, type, static_cast<int>(n),
-                                      CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+  if (k == 0) {
+    // cuBLAS rejects a zero leading dimension. An empty reduction projects to zeros, as MatMul does; the activation
+    // still runs on them so the outputs follow the same formula as for k > 0.
+    CUDA_RETURN_IF_ERROR(
+        cudaMemsetAsync(scratch, 0, static_cast<size_t>(rows) * static_cast<size_t>(n) * sizeof(uint16_t), stream));
+  } else {
+    const float one = 1.0f;
+    const float zero = 0.0f;
+    const cudaDataType_t type = is_bf16 ? CUDA_R_16BF : CUDA_R_16F;
+    CUBLAS_RETURN_IF_ERROR(cublasGemmEx(cublas, CUBLAS_OP_N, CUBLAS_OP_N, static_cast<int>(n),
+                                        static_cast<int>(rows), static_cast<int>(k), &one, w, type,
+                                        static_cast<int>(n), x, type, static_cast<int>(k), &zero, scratch, type,
+                                        static_cast<int>(n), CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+  }
   if (is_bf16) {
     LaunchSplitActivation<__nv_bfloat16>(stream, rows, n, router, inter, limit, alpha, beta, scratch, router_out,
                                          act_out);
